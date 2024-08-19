@@ -9,6 +9,7 @@ import boto3
 from botocore.client import Config
 import whisper
 import logging
+import json
 
 load_dotenv()
 
@@ -43,6 +44,10 @@ def upload_file(file_path, object_name):
     except Exception as e:
         logger.error(f"Upload error: {e}")
         raise
+
+def format_timestamp(seconds):
+    minutes, seconds = divmod(int(seconds), 60)
+    return f"{minutes:02d}:{seconds:02d}"
 
 @app.route('/convert_and_transcribe', methods=['POST'])
 def convert_and_transcribe():
@@ -79,18 +84,29 @@ def convert_and_transcribe():
         
         # Load Whisper model
         logger.info("Loading Whisper model...")
-        model = whisper.load_model("base")
+        model = whisper.load_model("base", device="cpu", in_memory=True)
         logger.info("Whisper model loaded")
 
-        # Transcribe audio
+        # Transcribe audio with timestamps
         logger.info("Transcribing audio...")
-        result = model.transcribe(mp3_path)
+        result = model.transcribe(mp3_path, word_timestamps=True)
         logger.info("Transcription complete")
+        
+        # Process transcription with timestamps
+        transcription_with_timestamps = []
+        for segment in result["segments"]:
+            start_time = format_timestamp(segment["start"])
+            end_time = format_timestamp(segment["end"])
+            text = segment["text"]
+            transcription_with_timestamps.append(f"[{start_time} - {end_time}] {text}")
+        
+        # Join the transcription segments
+        full_transcription = "\n".join(transcription_with_timestamps)
         
         # Upload transcription to MinIO
         transcription_filename = f"{os.path.splitext(video_filename)[0]}_transcription.txt"
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as temp_transcription_file:
-            temp_transcription_file.write(result["text"])
+            temp_transcription_file.write(full_transcription)
             temp_transcription_path = temp_transcription_file.name
         logger.info(f"Transcription saved to: {temp_transcription_path}")
 
