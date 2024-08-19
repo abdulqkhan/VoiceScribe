@@ -9,6 +9,8 @@ from botocore.client import Config
 import whisper
 import logging
 import subprocess
+import threading
+import uuid
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -55,6 +57,9 @@ except Exception as e:
     logger.error(f"Failed to initialize S3 client: {str(e)}")
     raise
 
+# In-memory job storage
+jobs = {}
+
 def get_public_url(filename):
     return f"{S3_ENDPOINT}/{S3_BUCKET}/{filename}"
 
@@ -71,17 +76,9 @@ def format_timestamp(seconds):
     minutes, seconds = divmod(int(seconds), 60)
     return f"{minutes:02d}:{seconds:02d}"
 
-@app.route('/convert_and_transcribe', methods=['POST'])
-def convert_and_transcribe():
-    logger.info("Convert and transcribe endpoint called.")
-    video_filename = request.json.get('video_filename')
-    if not video_filename:
-        logger.error("No video filename provided")
-        return jsonify({'error': 'No video filename provided'}), 400
-
-    video_url = get_public_url(video_filename)
-
+def process_video(job_id, video_filename):
     try:
+        video_url = get_public_url(video_filename)
         logger.info(f"Starting process for video: {video_url}")
         
         # Stream and convert video to MP3 using FFmpeg
@@ -104,8 +101,7 @@ def convert_and_transcribe():
         stdout, stderr = process.communicate()
         
         if process.returncode != 0:
-            logger.error(f"FFmpeg error: {stderr.decode()}")
-            return jsonify({'error': 'Failed to convert video'}), 500
+            raise Exception(f"FFmpeg error: {stderr.decode()}")
         
         logger.info("MP3 conversion complete")
         
@@ -149,15 +145,50 @@ def convert_and_transcribe():
         os.unlink(temp_transcription_path)
         logger.info("Temporary files cleaned up")
 
-        return jsonify({
-            'message': 'Video converted, transcribed, and uploaded successfully',
-            'mp3_url': get_public_url(mp3_filename),
-            'transcription_url': get_public_url(transcription_filename)
-        }), 200
-
+        jobs[job_id] = {
+            'status': 'completed',
+            'result': {
+                'message': 'Video converted, transcribed, and uploaded successfully',
+                'mp3_url': get_public_url(mp3_filename),
+                'transcription_url': get_public_url(transcription_filename)
+            }
+        }
     except Exception as e:
         logger.error(f"An error occurred: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        jobs[job_id] = {'status': 'failed', 'error': str(e)}
+
+@app.route('/convert_and_transcribe', methods=['POST'])
+def convert_and_transcribe():
+    logger.info("Convert and transcribe endpoint called.")
+    video_filename = request.json.get('video_filename')
+    if not video_filename:
+        logger.error("No video filename provided")
+        return jsonify({'error': 'No video filename provided'}), 400
+
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {'status': 'processing'}
+    
+    # Start the processing in a new thread
+    thread = threading.Thread(target=process_video, args=(job_id, video_filename))
+    thread.start()
+    
+    return jsonify({
+        'message': 'Task started successfully',
+        'job_id': job_id
+    }), 202  # 202 Accepted
+
+@app.route('/job_status/<job_id>', methods=['GET'])
+def get_job_status(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    
+    if job['status'] == 'completed':
+        return jsonify(job['result']), 200
+    elif job['status'] == 'failed':
+        return jsonify({'error': job['error']}), 500
+    else:
+        return jsonify({'status': 'processing'}), 202
 
 @app.route('/health', methods=['GET'])
 def health_check():
