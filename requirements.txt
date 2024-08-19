@@ -5,3 +5,5 @@ python-dotenv==0.19.1
 requests==2.26.0
 boto3==1.18.65
 openai-whisper==20230314
+numpy==1.21.6  # Specify an older version of NumPy
+torch==1.13.1  # Specify a compatible version of PyTorch
