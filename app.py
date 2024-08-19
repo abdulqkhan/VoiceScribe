@@ -1,23 +1,34 @@
 import os
+import sys
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-from pydub import AudioSegment
 import requests
 import tempfile
-from dotenv import load_dotenv
-import traceback
 import boto3
 from botocore.client import Config
 import whisper
 import logging
-import json
-
-load_dotenv()
-
-app = Flask(__name__)
+import subprocess
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Ensure logging to console
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+logger.info("Starting application...")
+
+# Load environment variables from .env file
+load_dotenv()
+
+logger.info("Environment variables loaded.")
+
+app = Flask(__name__)
 
 S3_ENDPOINT = os.getenv('S3_ENDPOINT')
 S3_BUCKET = os.getenv('S3_BUCKET')
@@ -26,12 +37,23 @@ S3_SECRET_KEY = os.getenv('S3_SECRET_KEY')
 
 logger.info(f"S3_ENDPOINT: {S3_ENDPOINT}")
 logger.info(f"S3_BUCKET: {S3_BUCKET}")
+logger.info(f"S3_ACCESS_KEY: {'*' * len(S3_ACCESS_KEY) if S3_ACCESS_KEY else 'Not set'}")
+logger.info(f"S3_SECRET_KEY: {'*' * len(S3_SECRET_KEY) if S3_SECRET_KEY else 'Not set'}")
 
-s3_client = boto3.client('s3',
-                         endpoint_url=S3_ENDPOINT,
-                         aws_access_key_id=S3_ACCESS_KEY,
-                         aws_secret_access_key=S3_SECRET_KEY,
-                         config=Config(signature_version='s3v4'))
+if not all([S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY]):
+    logger.error("One or more required environment variables are not set!")
+    raise ValueError("Missing required environment variables")
+
+try:
+    s3_client = boto3.client('s3',
+                             endpoint_url=S3_ENDPOINT,
+                             aws_access_key_id=S3_ACCESS_KEY,
+                             aws_secret_access_key=S3_SECRET_KEY,
+                             config=Config(signature_version='s3v4'))
+    logger.info("S3 client initialized successfully.")
+except Exception as e:
+    logger.error(f"Failed to initialize S3 client: {str(e)}")
+    raise
 
 def get_public_url(filename):
     return f"{S3_ENDPOINT}/{S3_BUCKET}/{filename}"
@@ -51,8 +73,10 @@ def format_timestamp(seconds):
 
 @app.route('/convert_and_transcribe', methods=['POST'])
 def convert_and_transcribe():
+    logger.info("Convert and transcribe endpoint called.")
     video_filename = request.json.get('video_filename')
     if not video_filename:
+        logger.error("No video filename provided")
         return jsonify({'error': 'No video filename provided'}), 400
 
     video_url = get_public_url(video_filename)
@@ -60,23 +84,30 @@ def convert_and_transcribe():
     try:
         logger.info(f"Starting process for video: {video_url}")
         
-        # Download video from public URL
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(video_filename)[1]) as temp_video_file:
-            logger.info(f"Downloading video from: {video_url}")
-            response = requests.get(video_url, stream=True)
-            response.raise_for_status()
-            for chunk in response.iter_content(chunk_size=8192):
-                temp_video_file.write(chunk)
-            temp_video_path = temp_video_file.name
-        logger.info(f"Video downloaded to: {temp_video_path}")
-
-        # Convert to MP3
-        logger.info("Converting video to MP3...")
-        audio = AudioSegment.from_file(temp_video_path)
+        # Stream and convert video to MP3 using FFmpeg
         mp3_filename = f"{os.path.splitext(video_filename)[0]}.mp3"
         mp3_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3').name
-        audio.export(mp3_path, format="mp3")
-        logger.info(f"MP3 conversion complete: {mp3_path}")
+        
+        logger.info(f"Converting video to MP3: {mp3_path}")
+        ffmpeg_command = [
+            'ffmpeg',
+            '-i', video_url,
+            '-vn',  # Disable video
+            '-acodec', 'libmp3lame',
+            '-ar', '44100',
+            '-ab', '192k',
+            '-y',  # Overwrite output file if it exists
+            mp3_path
+        ]
+        
+        process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = process.communicate()
+        
+        if process.returncode != 0:
+            logger.error(f"FFmpeg error: {stderr.decode()}")
+            return jsonify({'error': 'Failed to convert video'}), 500
+        
+        logger.info("MP3 conversion complete")
         
         # Upload MP3 to S3
         logger.info(f"Uploading MP3 to S3: {mp3_filename}")
@@ -84,12 +115,12 @@ def convert_and_transcribe():
         
         # Load Whisper model
         logger.info("Loading Whisper model...")
-        model = whisper.load_model("base", device="cpu", in_memory=True)
+        model = whisper.load_model("base", device="cpu")
         logger.info("Whisper model loaded")
 
-        # Transcribe audio with timestamps
+        # Transcribe audio
         logger.info("Transcribing audio...")
-        result = model.transcribe(mp3_path, word_timestamps=True)
+        result = model.transcribe(mp3_path)
         logger.info("Transcription complete")
         
         # Process transcription with timestamps
@@ -103,19 +134,17 @@ def convert_and_transcribe():
         # Join the transcription segments
         full_transcription = "\n".join(transcription_with_timestamps)
         
-        # Upload transcription to MinIO
+        # Upload transcription to S3
         transcription_filename = f"{os.path.splitext(video_filename)[0]}_transcription.txt"
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as temp_transcription_file:
             temp_transcription_file.write(full_transcription)
             temp_transcription_path = temp_transcription_file.name
-        logger.info(f"Transcription saved to: {temp_transcription_path}")
-
+        
         logger.info(f"Uploading transcription to S3: {transcription_filename}")
         upload_file(temp_transcription_path, transcription_filename)
         
         # Clean up temporary files
         logger.info("Cleaning up temporary files...")
-        os.unlink(temp_video_path)
         os.unlink(mp3_path)
         os.unlink(temp_transcription_path)
         logger.info("Temporary files cleaned up")
@@ -126,18 +155,17 @@ def convert_and_transcribe():
             'transcription_url': get_public_url(transcription_filename)
         }), 200
 
-    except requests.RequestException as e:
-        logger.error(f"Request error: {e}")
-        return jsonify({'error': str(e)}), 500
     except Exception as e:
         logger.error(f"An error occurred: {str(e)}")
-        logger.error(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
-    
 
 @app.route('/health', methods=['GET'])
 def health_check():
+    logger.info("Health check endpoint called.")
     return jsonify({"status": "healthy"}), 200
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    logger.info("Starting Flask application...")
+    app.run(host='0.0.0.0', port=5000)
+else:
+    logger.info("Flask application imported, not running directly.")
