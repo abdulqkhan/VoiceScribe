@@ -5,6 +5,7 @@ FROM python:3.9-slim-buster as builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     build-essential \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set up a virtual environment
@@ -19,9 +20,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Final stage
 FROM python:3.9-slim-buster
 
-# Copy FFmpeg from builder stage
-COPY --from=builder /usr/bin/ffmpeg /usr/bin/ffmpeg
-COPY --from=builder /usr/bin/ffprobe /usr/bin/ffprobe
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy the virtual environment from the builder stage
 COPY --from=builder /opt/venv /opt/venv
