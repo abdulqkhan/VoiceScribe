@@ -1,9 +1,14 @@
-Flask==2.0.1
-Werkzeug==2.0.1
-gunicorn==20.1.0
-python-dotenv==0.19.1
-requests==2.26.0
-boto3==1.18.65
-openai-whisper==20230314
-numpy==1.21.6  # Specify an older version of NumPy
-torch==1.13.1  # Specify a compatible version of PyTorch
+Flask==2.3.2
+Werkzeug==2.3.6
+gunicorn==21.2.0
+python-dotenv==1.0.0
+requests==2.32.3
+boto3==1.28.38
+botocore==1.31.38
+openai-whisper==20231117
+numpy==2.0.1
+torch==2.3.1
+numba==0.60.0
+pydub==0.25.1
+minio==7.2.8
+yt-dlp==2023.7.6
