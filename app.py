@@ -11,6 +11,7 @@ import logging
 import subprocess
 import threading
 import uuid
+import torch
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -111,8 +112,9 @@ def process_video(job_id, video_filename):
         
         # Load Whisper model
         logger.info("Loading Whisper model...")
-        model = whisper.load_model("base", device="cpu")
-        logger.info("Whisper model loaded")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = whisper.load_model("base", device=device)
+        logger.info(f"Whisper model loaded on {device}")
 
         # Transcribe audio
         logger.info("Transcribing audio...")
