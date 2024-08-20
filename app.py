@@ -12,6 +12,7 @@ import subprocess
 import threading
 import uuid
 import torch
+from urllib.error import URLError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -94,7 +95,7 @@ def process_video(job_id, video_filename):
             '-acodec', 'libmp3lame',
             '-ar', '44100',
             '-ab', '192k',
-            '-y',  
+            '-y',  # Overwrite output file if it exists
             mp3_path
         ]
         
@@ -113,8 +114,16 @@ def process_video(job_id, video_filename):
         # Load Whisper model
         logger.info("Loading Whisper model...")
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = whisper.load_model("base", device=device)
-        logger.info(f"Whisper model loaded on {device}")
+        logger.info(f"Using device: {device}")
+        try:
+            model = whisper.load_model("base", device=device)
+            logger.info(f"Whisper model loaded successfully on {device}")
+        except URLError as e:
+            logger.error(f"Network error while loading Whisper model: {str(e)}")
+            raise Exception("Failed to download Whisper model due to network error. Please check your internet connection and try again.")
+        except Exception as e:
+            logger.error(f"Error loading Whisper model: {str(e)}")
+            raise Exception(f"Failed to load Whisper model: {str(e)}")
 
         # Transcribe audio
         logger.info("Transcribing audio...")
