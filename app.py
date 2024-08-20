@@ -73,10 +73,20 @@ def upload_file(file_path, object_name):
     except Exception as e:
         logger.error(f"Upload error: {e}")
         raise
-
 def format_timestamp(seconds):
-    minutes, seconds = divmod(int(seconds), 60)
-    return f"{minutes:02d}:{seconds:02d}"
+    milliseconds = int((seconds - int(seconds)) * 1000)
+    hours, seconds = divmod(int(seconds), 3600)
+    minutes, seconds = divmod(seconds, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+def create_srt_content(segments):
+    srt_content = ""
+    for i, segment in enumerate(segments, start=1):
+        start_time = format_timestamp(segment['start'])
+        end_time = format_timestamp(segment['end'])
+        text = segment['text'].strip()
+        srt_content += f"{i}\n{start_time} --> {end_time}\n{text}\n\n"
+    return srt_content.strip()
 
 def process_video(job_id, video_filename):
     try:
@@ -130,7 +140,19 @@ def process_video(job_id, video_filename):
         result = model.transcribe(mp3_path)
         logger.info("Transcription complete")
         
-        # Process transcription with timestamps
+        # Create SRT content
+        srt_content = create_srt_content(result["segments"])
+        
+        # Save and upload SRT file
+        srt_filename = f"{os.path.splitext(video_filename)[0]}.srt"
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.srt') as temp_srt_file:
+            temp_srt_file.write(srt_content)
+            temp_srt_path = temp_srt_file.name
+        
+        logger.info(f"Uploading SRT to S3: {srt_filename}")
+        upload_file(temp_srt_path, srt_filename)
+        
+        # Process transcription with timestamps (for full transcription file)
         transcription_with_timestamps = []
         for segment in result["segments"]:
             start_time = format_timestamp(segment["start"])
@@ -153,15 +175,17 @@ def process_video(job_id, video_filename):
         # Clean up temporary files
         logger.info("Cleaning up temporary files...")
         os.unlink(mp3_path)
+        os.unlink(temp_srt_path)
         os.unlink(temp_transcription_path)
         logger.info("Temporary files cleaned up")
 
         jobs[job_id] = {
             'status': 'completed',
             'result': {
-                'message': 'Video converted, transcribed, and uploaded successfully',
+                'message': 'Video converted, transcribed, and subtitles generated successfully',
                 'mp3_url': get_public_url(mp3_filename),
-                'transcription_url': get_public_url(transcription_filename)
+                'transcription_url': get_public_url(transcription_filename),
+                'srt_url': get_public_url(srt_filename)
             }
         }
     except Exception as e:
