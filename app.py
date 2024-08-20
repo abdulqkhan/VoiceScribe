@@ -94,7 +94,7 @@ def process_video(job_id, video_filename):
             '-acodec', 'libmp3lame',
             '-ar', '44100',
             '-ab', '192k',
-            '-y',  # Overwrite output file if it exists
+            '-y',  
             mp3_path
         ]
         
