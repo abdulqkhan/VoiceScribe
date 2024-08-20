@@ -38,12 +38,17 @@ S3_ENDPOINT = os.getenv('S3_ENDPOINT')
 S3_BUCKET = os.getenv('S3_BUCKET')
 S3_ACCESS_KEY = os.getenv('S3_ACCESS_KEY')
 S3_SECRET_KEY = os.getenv('S3_SECRET_KEY')
+WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 
 logger.info(f"S3_ENDPOINT: {S3_ENDPOINT}")
 logger.info(f"S3_BUCKET: {S3_BUCKET}")
 logger.info(f"S3_ACCESS_KEY: {'*' * len(S3_ACCESS_KEY) if S3_ACCESS_KEY else 'Not set'}")
 logger.info(f"S3_SECRET_KEY: {'*' * len(S3_SECRET_KEY) if S3_SECRET_KEY else 'Not set'}")
+logger.info(f"WEBHOOK_URL: {'Set' if WEBHOOK_URL else 'Not set'}")
 
+if not WEBHOOK_URL:
+    logger.warning("WEBHOOK_URL is not set. Webhook notifications will be disabled.")
+    
 if not all([S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY]):
     logger.error("One or more required environment variables are not set!")
     raise ValueError("Missing required environment variables")
@@ -88,6 +93,31 @@ def create_srt_content(segments):
         text = segment['text'].strip()
         srt_content += f"{i}\n{start_time} --> {end_time}\n{text}\n\n"
     return srt_content.strip()
+
+
+def send_webhook_alert(job_id, status, result=None):
+    if not WEBHOOK_URL:
+        logger.warning(f"Webhook URL not set. Skipping webhook alert for job {job_id}.")
+        return
+
+    payload = {
+        'job_id': job_id,
+        'status': status
+    }
+    if result:
+        payload['result'] = result
+
+    logger.info(f"Attempting to send webhook alert for job {job_id} to {WEBHOOK_URL}")
+    try:
+        response = requests.post(WEBHOOK_URL, json=payload, timeout=10)  # Add a timeout
+        logger.info(f"Webhook response status code: {response.status_code}")
+        logger.info(f"Webhook response content: {response.text}")
+        if response.status_code == 200:
+            logger.info(f"Webhook alert sent successfully for job {job_id}")
+        else:
+            logger.warning(f"Failed to send webhook alert for job {job_id}. Status code: {response.status_code}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error sending webhook alert for job {job_id}: {str(e)}")
 
 def process_audio(job_id, filename):
     try:
@@ -200,9 +230,17 @@ def process_audio(job_id, filename):
                 'srt_url': get_public_url(srt_filename)
             }
         }
+        logger.info(f"Job {job_id} completed. Sending webhook alert.")
+        send_webhook_alert(job_id, 'completed', jobs[job_id]['result'])
+        logger.info(f"Webhook alert sent for job {job_id}")
+        
     except Exception as e:
-        logger.error(f"An error occurred: {str(e)}")
+        logger.error(f"An error occurred in process_audio: {str(e)}")
         jobs[job_id] = {'status': 'failed', 'error': str(e)}
+        
+        logger.info(f"Job {job_id} failed. Sending webhook alert.")
+        send_webhook_alert(job_id, 'failed', {'error': str(e)})
+        logger.info(f"Webhook alert sent for failed job {job_id}")
 
 @app.route('/convert_and_transcribe', methods=['POST'])
 def convert_and_transcribe():
