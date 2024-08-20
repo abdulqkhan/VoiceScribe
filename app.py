@@ -73,6 +73,7 @@ def upload_file(file_path, object_name):
     except Exception as e:
         logger.error(f"Upload error: {e}")
         raise
+
 def format_timestamp(seconds):
     milliseconds = int((seconds - int(seconds)) * 1000)
     hours, seconds = divmod(int(seconds), 3600)
@@ -88,38 +89,49 @@ def create_srt_content(segments):
         srt_content += f"{i}\n{start_time} --> {end_time}\n{text}\n\n"
     return srt_content.strip()
 
-def process_video(job_id, video_filename):
+def process_audio(job_id, filename):
     try:
-        video_url = get_public_url(video_filename)
-        logger.info(f"Starting process for video: {video_url}")
+        file_url = get_public_url(filename)
+        logger.info(f"Starting process for file: {file_url}")
         
-        # Stream and convert video to MP3 using FFmpeg
-        mp3_filename = f"{os.path.splitext(video_filename)[0]}.mp3"
-        mp3_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3').name
+        # Determine if the file is MP3 or needs conversion
+        file_extension = os.path.splitext(filename)[1].lower()
+        if file_extension == '.mp3':
+            mp3_filename = filename
+            mp3_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3').name
+            logger.info(f"Downloading MP3 file: {mp3_path}")
+            response = requests.get(file_url)
+            with open(mp3_path, 'wb') as f:
+                f.write(response.content)
+        else:
+            # Convert video to MP3 using FFmpeg
+            mp3_filename = f"{os.path.splitext(filename)[0]}.mp3"
+            mp3_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3').name
+            
+            logger.info(f"Converting file to MP3: {mp3_path}")
+            ffmpeg_command = [
+                'ffmpeg',
+                '-i', file_url,
+                '-vn',  # Disable video
+                '-acodec', 'libmp3lame',
+                '-ar', '44100',
+                '-ab', '192k',
+                '-y',  # Overwrite output file if it exists
+                mp3_path
+            ]
+            
+            process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+            
+            if process.returncode != 0:
+                raise Exception(f"FFmpeg error: {stderr.decode()}")
+            
+            logger.info("MP3 conversion complete")
         
-        logger.info(f"Converting video to MP3: {mp3_path}")
-        ffmpeg_command = [
-            'ffmpeg',
-            '-i', video_url,
-            '-vn',  # Disable video
-            '-acodec', 'libmp3lame',
-            '-ar', '44100',
-            '-ab', '192k',
-            '-y',  # Overwrite output file if it exists
-            mp3_path
-        ]
-        
-        process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = process.communicate()
-        
-        if process.returncode != 0:
-            raise Exception(f"FFmpeg error: {stderr.decode()}")
-        
-        logger.info("MP3 conversion complete")
-        
-        # Upload MP3 to S3
-        logger.info(f"Uploading MP3 to S3: {mp3_filename}")
-        upload_file(mp3_path, mp3_filename)
+        # Upload MP3 to S3 if it was converted
+        if file_extension != '.mp3':
+            logger.info(f"Uploading MP3 to S3: {mp3_filename}")
+            upload_file(mp3_path, mp3_filename)
         
         # Load Whisper model
         logger.info("Loading Whisper model...")
@@ -144,7 +156,7 @@ def process_video(job_id, video_filename):
         srt_content = create_srt_content(result["segments"])
         
         # Save and upload SRT file
-        srt_filename = f"{os.path.splitext(video_filename)[0]}.srt"
+        srt_filename = f"{os.path.splitext(filename)[0]}.srt"
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.srt') as temp_srt_file:
             temp_srt_file.write(srt_content)
             temp_srt_path = temp_srt_file.name
@@ -164,7 +176,7 @@ def process_video(job_id, video_filename):
         full_transcription = "\n".join(transcription_with_timestamps)
         
         # Upload transcription to S3
-        transcription_filename = f"{os.path.splitext(video_filename)[0]}_transcription.txt"
+        transcription_filename = f"{os.path.splitext(filename)[0]}_transcription.txt"
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as temp_transcription_file:
             temp_transcription_file.write(full_transcription)
             temp_transcription_path = temp_transcription_file.name
@@ -182,7 +194,7 @@ def process_video(job_id, video_filename):
         jobs[job_id] = {
             'status': 'completed',
             'result': {
-                'message': 'Video converted, transcribed, and subtitles generated successfully',
+                'message': 'File processed, transcribed, and subtitles generated successfully',
                 'mp3_url': get_public_url(mp3_filename),
                 'transcription_url': get_public_url(transcription_filename),
                 'srt_url': get_public_url(srt_filename)
@@ -195,16 +207,16 @@ def process_video(job_id, video_filename):
 @app.route('/convert_and_transcribe', methods=['POST'])
 def convert_and_transcribe():
     logger.info("Convert and transcribe endpoint called.")
-    video_filename = request.json.get('video_filename')
-    if not video_filename:
-        logger.error("No video filename provided")
-        return jsonify({'error': 'No video filename provided'}), 400
+    filename = request.json.get('filename')
+    if not filename:
+        logger.error("No filename provided")
+        return jsonify({'error': 'No filename provided'}), 400
 
     job_id = str(uuid.uuid4())
     jobs[job_id] = {'status': 'processing'}
     
     # Start the processing in a new thread
-    thread = threading.Thread(target=process_video, args=(job_id, video_filename))
+    thread = threading.Thread(target=process_audio, args=(job_id, filename))
     thread.start()
     
     return jsonify({
