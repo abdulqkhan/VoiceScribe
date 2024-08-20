@@ -225,9 +225,10 @@ def process_audio(job_id, filename):
             'status': 'completed',
             'result': {
                 'message': 'File processed, transcribed, and subtitles generated successfully',
-                'mp3_url': get_public_url(mp3_filename),
-                'transcription_url': get_public_url(transcription_filename),
-                'srt_url': get_public_url(srt_filename)
+                'original_filename': filename,
+                'mp3_filename': mp3_filename,
+                'transcription_filename': transcription_filename,
+                'srt_filename': srt_filename
             }
         }
         logger.info(f"Job {job_id} completed. Sending webhook alert.")
