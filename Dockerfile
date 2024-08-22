@@ -43,5 +43,8 @@ COPY . .
 # Make port 5000 available
 EXPOSE 5000
 
+# Install Gunicorn
+RUN pip install --no-cache-dir gunicorn==20.1.0
+
 # Run the application
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "0", "--graceful-timeout", "300", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "0", "--graceful-timeout", "300", "app.routes:app"]
