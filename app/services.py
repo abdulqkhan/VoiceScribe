@@ -1,10 +1,13 @@
 import os
+import io
 import tempfile
 import boto3
 from botocore.client import Config
 import whisper
 import requests
 import subprocess
+import numpy as np
+import soundfile as sf
 import torch
 from urllib.error import URLError
 from pydub import AudioSegment
@@ -116,6 +119,12 @@ def combine_analyses(whisper_result, silent_parts, total_duration):
         if len(occurrences) > 1:
             analysis['repeated_sentences'].append(occurrences)
     
+    # Specific phrase detection
+    specific_phrases = ["cut","bad take","redo"]
+    for phrase in specific_phrases:
+        if phrase in segment_text_map:
+            analysis['repeated_sentences'].append(segment_text_map[phrase])
+    
     return analysis
 
 def generate_analysis_report(analysis):
@@ -154,41 +163,48 @@ def process_audio(job_id, filename):
         file_url = get_public_url(filename)
         logger.info(f"Starting process for file: {file_url}")
         
-        file_extension = os.path.splitext(filename)[1].lower()
-        if file_extension == '.mp3':
-            mp3_filename = filename
-            mp3_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3').name
-            logger.info(f"Downloading MP3 file: {mp3_path}")
-            response = requests.get(file_url)
-            with open(mp3_path, 'wb') as f:
-                f.write(response.content)
-        else:
-            mp3_filename = f"{os.path.splitext(filename)[0]}.mp3"
-            mp3_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3').name
-            
-            logger.info(f"Converting file to MP3: {mp3_path}")
-            ffmpeg_command = [
-                'ffmpeg',
-                '-i', file_url,
-                '-vn',
-                '-acodec', 'libmp3lame',
-                '-ar', '44100',
-                '-ab', '192k',
-                '-y',
-                mp3_path
-            ]
-            
-            process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = process.communicate()
-            
-            if process.returncode != 0:
-                raise Exception(f"FFmpeg error: {stderr.decode()}")
-            
-            logger.info("MP3 conversion complete")
+        # Stream the file from S3
+        s3_object = s3_client.get_object(Bucket=S3_BUCKET, Key=filename)
+        file_stream = io.BytesIO(s3_object['Body'].read())
         
-        if file_extension != '.mp3':
-            logger.info(f"Uploading MP3 to S3: {mp3_filename}")
-            upload_file(mp3_path, mp3_filename)
+        # Determine the file type
+        file_extension = os.path.splitext(filename)[1].lower()
+        
+        # Convert to WAV if necessary (Whisper works well with WAV)
+        if file_extension != '.wav':
+            logger.info(f"Converting file to WAV")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_input_file:
+                temp_input_file.write(file_stream.getvalue())
+                temp_input_file.flush()
+                
+                temp_output_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+                temp_output_file.close()
+                
+                ffmpeg_command = [
+                    'ffmpeg',
+                    '-i', temp_input_file.name,
+                    '-acodec', 'pcm_s16le',
+                    '-ar', '16000',
+                    '-ac', '1',
+                    '-y',
+                    temp_output_file.name
+                ]
+                
+                process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stdout, stderr = process.communicate()
+                
+                if process.returncode != 0:
+                    raise Exception(f"FFmpeg error: {stderr.decode()}")
+                
+                audio_path = temp_output_file.name
+                
+                # Clean up input temporary file
+                os.unlink(temp_input_file.name)
+        else:
+            # If it's already a WAV, save it to a temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_wav_file:
+                temp_wav_file.write(file_stream.getvalue())
+                audio_path = temp_wav_file.name
         
         logger.info("Loading Whisper model...")
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -196,15 +212,12 @@ def process_audio(job_id, filename):
         try:
             model = whisper.load_model("base", device=device)
             logger.info(f"Whisper model loaded successfully on {device}")
-        except URLError as e:
-            logger.error(f"Network error while loading Whisper model: {str(e)}")
-            raise Exception("Failed to download Whisper model due to network error. Please check your internet connection and try again.")
         except Exception as e:
             logger.error(f"Error loading Whisper model: {str(e)}")
             raise Exception(f"Failed to load Whisper model: {str(e)}")
 
         logger.info("Transcribing audio...")
-        result = model.transcribe(mp3_path)
+        result = model.transcribe(audio_path)
         logger.info("Transcription complete")
         
         srt_content = create_srt_content(result["segments"])
@@ -234,11 +247,21 @@ def process_audio(job_id, filename):
         logger.info(f"Uploading transcription to S3: {transcription_filename}")
         upload_file(temp_transcription_path, transcription_filename)
         
-        silent_parts = analyze_audio_silence(mp3_path)
-        whisper_result = model.transcribe(mp3_path)
-        total_duration = get_audio_duration(mp3_path)
-        analysis_result = combine_analyses(whisper_result, silent_parts, total_duration)
+        logger.info("Analyzing audio silence...")
+        silent_parts = analyze_audio_silence(audio_path)
+        logger.info("Audio silence analysis complete")
+        
+        logger.info("Getting audio duration...")
+        total_duration = get_audio_duration(audio_path)
+        logger.info(f"Audio duration: {total_duration} seconds")
+        
+        logger.info("Combining analyses...")
+        analysis_result = combine_analyses(result, silent_parts, total_duration)
+        logger.info("Analysis combination complete")
+        
+        logger.info("Generating analysis report...")
         report = generate_analysis_report(analysis_result)
+        logger.info("Analysis report generated")
         
         report_filename = f"{os.path.splitext(filename)[0]}_report.txt"
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as temp_report_file:
@@ -249,7 +272,7 @@ def process_audio(job_id, filename):
         upload_file(temp_report_path, report_filename)
 
         logger.info("Cleaning up temporary files...")
-        os.unlink(mp3_path)
+        os.unlink(audio_path)
         os.unlink(temp_srt_path)
         os.unlink(temp_transcription_path)
         os.unlink(temp_report_path)
@@ -260,7 +283,6 @@ def process_audio(job_id, filename):
             'result': {
                 'message': 'File processed, transcribed, and analyzed successfully',
                 'original_filename': filename,
-                'mp3_filename': mp3_filename,
                 'transcription_filename': transcription_filename,
                 'srt_filename': srt_filename,
                 'report_filename': report_filename
