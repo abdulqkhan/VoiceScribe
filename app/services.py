@@ -13,6 +13,7 @@ import concurrent.futures
 from urllib.error import URLError
 from pydub import AudioSegment
 from pydub.silence import detect_silence
+from pydub.silence import detect_nonsilent
 from app.utils import configure_logging, jobs
 from config.settings import S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY, WEBHOOK_URL
 
@@ -159,6 +160,35 @@ def generate_analysis_report(analysis):
 
     return report
 
+def stream_transcribe_chunks(audio_chunks):
+    total_chunks = len(audio_chunks)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    max_workers = torch.cuda.device_count() if device == "cuda" else os.cpu_count()
+    
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        results = [None] * total_chunks
+        next_chunk_to_process = 0
+        
+        while next_chunk_to_process < total_chunks or futures:
+            # Submit new tasks
+            while next_chunk_to_process < total_chunks and len(futures) < max_workers:
+                future = executor.submit(transcribe_chunk, audio_chunks[next_chunk_to_process], next_chunk_to_process, total_chunks, device)
+                futures[future] = next_chunk_to_process
+                next_chunk_to_process += 1
+            
+            # Process completed tasks
+            done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                chunk_index, result = future.result()
+                results[chunk_index] = result
+                del futures[future]
+                
+                # Report progress
+                progress = (chunk_index + 1) / total_chunks * 100
+                logger.info(f"Transcription progress: {progress:.2f}%")
+    
+    return [r for r in results if r is not None]
 def split_audio_file(audio_path, chunk_duration=300):  # chunk_duration in seconds (5 minutes)
     audio = AudioSegment.from_wav(audio_path)
     total_duration = len(audio) / 1000  # Duration in seconds
@@ -174,29 +204,70 @@ def split_audio_file(audio_path, chunk_duration=300):  # chunk_duration in secon
         chunks.append(chunk_file.name)
 
     return chunks, total_duration
-def transcribe_chunk(model, chunk_path, chunk_index, total_chunks):
+def transcribe_chunk(chunk_path, chunk_index, total_chunks, device):
     logger.info(f"Transcribing chunk {chunk_index+1}/{total_chunks}")
-    result = model.transcribe(chunk_path)
-    os.unlink(chunk_path)  # Remove the chunk file after processing
-    return result
-
-def parallel_transcribe_chunks(model, audio_chunks):
+    retries = 3
+    for attempt in range(retries):
+        try:
+            model = whisper.load_model("base", device=device)
+            result = model.transcribe(chunk_path)
+            os.unlink(chunk_path)  # Remove the chunk file after processing
+            return chunk_index, result
+        except Exception as e:
+            if attempt < retries - 1:
+                logger.warning(f"Error transcribing chunk {chunk_index+1} (attempt {attempt+1}): {str(e)}. Retrying...")
+            else:
+                logger.error(f"Failed to transcribe chunk {chunk_index+1} after {retries} attempts: {str(e)}")
+                return chunk_index, None
+def adaptive_split_audio(audio_path, min_silence_len=1000, silence_thresh=-40, min_chunk_size=10000, max_chunk_size=30000):
+    audio = AudioSegment.from_wav(audio_path)
+    non_silent_ranges = detect_nonsilent(audio, min_silence_len=min_silence_len, silence_thresh=silence_thresh)
+    
+    chunks = []
+    start = 0
+    for non_silent_start, non_silent_end in non_silent_ranges:
+        if non_silent_start - start > max_chunk_size:
+            # If silence is too long, create a chunk
+            chunk = audio[start:non_silent_start]
+            chunks.append(chunk)
+            start = non_silent_start
+        elif non_silent_end - start > max_chunk_size:
+            # If chunk would be too long, split at a silence point
+            split_point = start + max_chunk_size
+            chunk = audio[start:split_point]
+            chunks.append(chunk)
+            start = split_point
+    
+    # Add the last chunk
+    if len(audio) - start > min_chunk_size:
+        chunks.append(audio[start:])
+    
+    # Save chunks to temporary files
+    chunk_files = []
+    for i, chunk in enumerate(chunks):
+        chunk_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+        chunk.export(chunk_file.name, format="wav")
+        chunk_files.append(chunk_file.name)
+    
+    return chunk_files, len(audio) / 1000.0  # Return chunk files and total duration in seconds
+def parallel_transcribe_chunks(audio_chunks):
     total_chunks = len(audio_chunks)
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future_to_chunk = {executor.submit(transcribe_chunk, model, chunk, i, total_chunks): i 
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        future_to_chunk = {executor.submit(transcribe_chunk, chunk, i, total_chunks): i 
                            for i, chunk in enumerate(audio_chunks)}
         results = []
         for future in concurrent.futures.as_completed(future_to_chunk):
             chunk_index = future_to_chunk[future]
             try:
                 result = future.result()
-                results.append((chunk_index, result))
+                if result is not None:
+                    results.append((chunk_index, result))
             except Exception as exc:
                 logger.error(f"Chunk {chunk_index} generated an exception: {exc}")
     
     # Sort results by chunk index to maintain correct order
     results.sort(key=lambda x: x[0])
-    return [r[1] for r in results]
+    return [r[1] for r in results if r[1] is not None]
 
 def process_audio(job_id, filename):
     try:
@@ -207,130 +278,60 @@ def process_audio(job_id, filename):
         s3_object = s3_client.get_object(Bucket=S3_BUCKET, Key=filename)
         file_stream = io.BytesIO(s3_object['Body'].read())
         
-        # Determine the file type
+        # Determine the file type and convert to WAV if necessary
         file_extension = os.path.splitext(filename)[1].lower()
-        
-        # Convert to WAV if necessary (Whisper works well with WAV)
-        if file_extension != '.wav':
-            logger.info(f"Converting file to WAV")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_input_file:
-                temp_input_file.write(file_stream.getvalue())
-                temp_input_file.flush()
-                
-                temp_output_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
-                temp_output_file.close()
-                
-                ffmpeg_command = [
-                    'ffmpeg',
-                    '-i', temp_input_file.name,
-                    '-acodec', 'pcm_s16le',
-                    '-ar', '16000',
-                    '-ac', '1',
-                    '-y',
-                    temp_output_file.name
-                ]
-                
-                process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                stdout, stderr = process.communicate()
-                
-                if process.returncode != 0:
-                    raise Exception(f"FFmpeg error: {stderr.decode()}")
-                
-                audio_path = temp_output_file.name
-                
-                # Clean up input temporary file
-                os.unlink(temp_input_file.name)
-        else:
-            # If it's already a WAV, save it to a temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_wav_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_wav_file:
+            if file_extension != '.wav':
+                logger.info(f"Converting file to WAV")
+                audio = AudioSegment.from_file(file_stream, format=file_extension[1:])
+                audio.export(temp_wav_file.name, format="wav")
+            else:
                 temp_wav_file.write(file_stream.getvalue())
-                audio_path = temp_wav_file.name
+            audio_path = temp_wav_file.name
         
-        logger.info("Splitting audio file into chunks...")
-        audio_chunks, total_duration = split_audio_file(audio_path)
+        logger.info("Adaptively splitting audio file into chunks...")
+        audio_chunks, total_duration = adaptive_split_audio(audio_path)
         logger.info(f"Audio file split into {len(audio_chunks)} chunks")
 
-        logger.info("Loading Whisper model...")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Using device: {device}")
-        try:
-            model = whisper.load_model("base", device=device)
-            logger.info(f"Whisper model loaded successfully on {device}")
-        except Exception as e:
-            logger.error(f"Error loading Whisper model: {str(e)}")
-            raise Exception(f"Failed to load Whisper model: {str(e)}")
-
         logger.info("Transcribing audio chunks in parallel...")
-        results = parallel_transcribe_chunks(model, audio_chunks)
+        results = stream_transcribe_chunks(audio_chunks)
         logger.info("Parallel transcription of all chunks complete")
 
         # Combine results from all chunks
         combined_segments = []
+        combined_text = []
         time_offset = 0
         for result in results:
+            combined_text.append(result["text"])
             for segment in result["segments"]:
-                segment["start"] += time_offset
-                segment["end"] += time_offset
-                combined_segments.append(segment)
+                adjusted_segment = segment.copy()
+                adjusted_segment["start"] += time_offset
+                adjusted_segment["end"] += time_offset
+                combined_segments.append(adjusted_segment)
             time_offset += result["segments"][-1]["end"] if result["segments"] else 0
 
         combined_result = {
-            "text": " ".join(result["text"] for result in results),
+            "text": " ".join(combined_text),
             "segments": combined_segments
         }
         
+        # Create and upload SRT content
         srt_content = create_srt_content(combined_result["segments"])
-        
         srt_filename = f"{os.path.splitext(filename)[0]}.srt"
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.srt') as temp_srt_file:
-            temp_srt_file.write(srt_content)
-            temp_srt_path = temp_srt_file.name
+        upload_string_to_s3(srt_content, srt_filename)
         
-        logger.info(f"Uploading SRT to S3: {srt_filename}")
-        upload_file(temp_srt_path, srt_filename)
-        
-        transcription_with_timestamps = []
-        for segment in combined_result["segments"]:
-            start_time = format_timestamp(segment["start"])
-            end_time = format_timestamp(segment["end"])
-            text = segment["text"]
-            transcription_with_timestamps.append(f"[{start_time} - {end_time}] {text}")
-        
-        full_transcription = "\n".join(transcription_with_timestamps)
-        
+        # Create and upload full transcription
+        full_transcription = "\n".join([f"[{format_timestamp(seg['start'])} - {format_timestamp(seg['end'])}] {seg['text']}" for seg in combined_result["segments"]])
         transcription_filename = f"{os.path.splitext(filename)[0]}_transcription.txt"
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as temp_transcription_file:
-            temp_transcription_file.write(full_transcription)
-            temp_transcription_path = temp_transcription_file.name
+        upload_string_to_s3(full_transcription, transcription_filename)
         
-        logger.info(f"Uploading transcription to S3: {transcription_filename}")
-        upload_file(temp_transcription_path, transcription_filename)
-        
-        logger.info("Analyzing audio silence...")
-        silent_parts = analyze_audio_silence(audio_path)
-        logger.info("Audio silence analysis complete")
-        
-        logger.info("Combining analyses...")
-        analysis_result = combine_analyses(combined_result, silent_parts, total_duration)
-        logger.info("Analysis combination complete")
-        
-        logger.info("Generating analysis report...")
-        report = generate_analysis_report(analysis_result)
-        logger.info("Analysis report generated")
-        
+        # Generate and upload analysis report
+        report = generate_analysis_report(combined_result, total_duration)
         report_filename = f"{os.path.splitext(filename)[0]}_report.txt"
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as temp_report_file:
-            temp_report_file.write(report)
-            temp_report_path = temp_report_file.name
-        
-        logger.info(f"Uploading analysis report to S3: {report_filename}")
-        upload_file(temp_report_path, report_filename)
+        upload_string_to_s3(report, report_filename)
 
         logger.info("Cleaning up temporary files...")
         os.unlink(audio_path)
-        os.unlink(temp_srt_path)
-        os.unlink(temp_transcription_path)
-        os.unlink(temp_report_path)
         logger.info("Temporary files cleaned up")
 
         jobs[job_id] = {
@@ -345,16 +346,19 @@ def process_audio(job_id, filename):
         }
         logger.info(f"Job {job_id} completed. Sending webhook alert.")
         send_webhook_alert(job_id, 'completed', jobs[job_id]['result'])
-        logger.info(f"Webhook alert sent for job {job_id}")
         
     except Exception as e:
         logger.error(f"An error occurred in process_audio: {str(e)}")
         jobs[job_id] = {'status': 'failed', 'error': str(e)}
-        
-        logger.info(f"Job {job_id} failed. Sending webhook alert.")
         send_webhook_alert(job_id, 'failed', {'error': str(e)})
-        logger.info(f"Webhook alert sent for failed job {job_id}")
         
+def upload_string_to_s3(content, filename):
+    with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_file:
+        temp_file.write(content)
+        temp_file.flush()
+        logger.info(f"Uploading {filename} to S3")
+        upload_file(temp_file.name, filename)
+    os.unlink(temp_file.name)        
         
 def send_webhook_alert(job_id, status, result=None):
     if not WEBHOOK_URL:
