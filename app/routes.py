@@ -49,7 +49,7 @@ def convert_and_transcribe():
         return jsonify({'error': 'No filename provided'}), 400
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {'status': 'processing'}
+    jobs[job_id] = {'status': 'queued'}
     
     thread = threading.Thread(target=process_audio, args=(job_id, filename))
     thread.start()

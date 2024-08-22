@@ -5,7 +5,7 @@ import boto3
 from botocore.client import Config
 import whisper
 import requests
-import subprocess
+import time
 import numpy as np
 import soundfile as sf
 import torch
@@ -129,34 +129,50 @@ def combine_analyses(whisper_result, silent_parts, total_duration):
     
     return analysis
 
-def generate_analysis_report(analysis):
+def generate_analysis_report(combined_result, total_duration):
     report = f"Video Analysis Report\n"
     report += f"====================\n\n"
-    report += f"Total Duration: {analysis['total_duration']}\n"
-    report += f"Total Segments: {analysis['total_segments']}\n\n"
+    report += f"Total Duration: {format_timestamp(total_duration)}\n"
+    report += f"Total Segments: {len(combined_result['segments'])}\n\n"
 
-    if analysis['silent_parts']:
+    # Analyze silent parts
+    silent_parts = []
+    for i, segment in enumerate(combined_result['segments']):
+        if i > 0:
+            gap = segment['start'] - combined_result['segments'][i-1]['end']
+            if gap > 1:  # Consider gaps longer than 1 second as silent parts
+                silent_parts.append({
+                    'start': format_timestamp(combined_result['segments'][i-1]['end']),
+                    'end': format_timestamp(segment['start']),
+                    'duration': gap
+                })
+
+    if silent_parts:
         report += f"Silent Parts (>1 second):\n"
-        for i, silent in enumerate(analysis['silent_parts']):
-            if i == 0 and silent['start'] == "00:00:00,000":
-                report += f"  - Initial silence: [{silent['start']} - {silent['end']}] Duration: {silent['duration']} seconds\n"
-            else:
-                report += f"  - [{silent['start']} - {silent['end']}] Duration: {silent['duration']} seconds\n"
+        for i, silent in enumerate(silent_parts):
+            report += f"  - [{silent['start']} - {silent['end']}] Duration: {silent['duration']:.2f} seconds\n"
         report += "\n"
 
-    if analysis['repeated_sentences']:
+    # Analyze repeated sentences
+    sentence_occurrences = {}
+    for segment in combined_result['segments']:
+        text = segment['text'].strip().lower()
+        if text in sentence_occurrences:
+            sentence_occurrences[text].append(segment)
+        else:
+            sentence_occurrences[text] = [segment]
+
+    repeated_sentences = {text: occurrences for text, occurrences in sentence_occurrences.items() if len(occurrences) > 1}
+
+    if repeated_sentences:
         report += f"Repeated Sentences:\n"
-        for repeat in analysis['repeated_sentences']:
-            report += f"  - '{repeat[0]['text']}' (Repeated {len(repeat)} times)\n"
-            for occur in repeat:
-                report += f"    [{occur['start']} - {occur['end']}]\n"
+        for text, occurrences in repeated_sentences.items():
+            report += f"  - '{text}' (Repeated {len(occurrences)} times)\n"
+            for occur in occurrences:
+                report += f"    [{format_timestamp(occur['start'])} - {format_timestamp(occur['end'])}]\n"
         report += "\n"
 
-    if analysis['flagged_for_deletion']:
-        report += f"Segments Flagged for Deletion:\n"
-        for flagged in analysis['flagged_for_deletion']:
-            report += f"  - [{flagged['start']} - {flagged['end']}] {flagged['text']}\n"
-        report += "\n"
+    # You can add more analysis here as needed
 
     return report
 
@@ -268,34 +284,90 @@ def parallel_transcribe_chunks(audio_chunks):
     # Sort results by chunk index to maintain correct order
     results.sort(key=lambda x: x[0])
     return [r[1] for r in results if r[1] is not None]
+def sequential_transcribe_chunks(audio_chunks, job_id):
+    total_chunks = len(audio_chunks)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Using device: {device}")
+    
+    try:
+        model = whisper.load_model("base", device=device)
+        logger.info(f"Whisper model loaded successfully on {device}")
+    except Exception as e:
+        logger.error(f"Failed to load Whisper model: {str(e)}")
+        raise
+
+    results = []
+    for i, chunk_path in enumerate(audio_chunks):
+        chunk_start_time = time.time()
+        logger.info(f"Starting transcription of chunk {i+1}/{total_chunks}")
+        try:
+            result = model.transcribe(chunk_path)
+            results.append(result)
+            os.unlink(chunk_path)  # Remove the chunk file after processing
+            chunk_end_time = time.time()
+            chunk_duration = chunk_end_time - chunk_start_time
+            logger.info(f"Completed transcription of chunk {i+1}/{total_chunks} in {chunk_duration:.2f} seconds")
+            
+            # Update job status
+            progress = ((i + 1) / total_chunks) * 100
+            update_job_status(job_id, f"Transcribing: {progress:.2f}% complete")
+            
+        except Exception as e:
+            logger.error(f"Error transcribing chunk {i+1}: {str(e)}")
+            # Continue with the next chunk instead of stopping the entire process
+    
+    return results
 
 def process_audio(job_id, filename):
     try:
         file_url = get_public_url(filename)
         logger.info(f"Starting process for file: {file_url}")
         
-        # Stream the file from S3
-        s3_object = s3_client.get_object(Bucket=S3_BUCKET, Key=filename)
-        file_stream = io.BytesIO(s3_object['Body'].read())
+        # Initialize job status
+        jobs[job_id] = {'status': 'started'}
+        update_job_status(job_id, "Started")
         
+        # Stream the file from S3
+        try:
+            s3_object = s3_client.get_object(Bucket=S3_BUCKET, Key=filename)
+            file_stream = io.BytesIO(s3_object['Body'].read())
+        except Exception as e:
+            logger.error(f"Error streaming file from S3: {str(e)}")
+            raise
+
         # Determine the file type and convert to WAV if necessary
         file_extension = os.path.splitext(filename)[1].lower()
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_wav_file:
-            if file_extension != '.wav':
-                logger.info(f"Converting file to WAV")
-                audio = AudioSegment.from_file(file_stream, format=file_extension[1:])
-                audio.export(temp_wav_file.name, format="wav")
-            else:
-                temp_wav_file.write(file_stream.getvalue())
-            audio_path = temp_wav_file.name
-        
-        logger.info("Adaptively splitting audio file into chunks...")
-        audio_chunks, total_duration = adaptive_split_audio(audio_path)
-        logger.info(f"Audio file split into {len(audio_chunks)} chunks")
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_wav_file:
+                if file_extension != '.wav':
+                    logger.info(f"Converting file to WAV")
+                    update_job_status(job_id, "Converting to WAV")
+                    audio = AudioSegment.from_file(file_stream, format=file_extension[1:])
+                    audio.export(temp_wav_file.name, format="wav")
+                else:
+                    temp_wav_file.write(file_stream.getvalue())
+                audio_path = temp_wav_file.name
+        except Exception as e:
+            logger.error(f"Error converting file to WAV: {str(e)}")
+            raise
 
-        logger.info("Transcribing audio chunks in parallel...")
-        results = stream_transcribe_chunks(audio_chunks)
-        logger.info("Parallel transcription of all chunks complete")
+        logger.info("Adaptively splitting audio file into chunks...")
+        update_job_status(job_id, "Splitting audio")
+        try:
+            audio_chunks, total_duration = adaptive_split_audio(audio_path)
+            logger.info(f"Audio file split into {len(audio_chunks)} chunks")
+        except Exception as e:
+            logger.error(f"Error splitting audio into chunks: {str(e)}")
+            raise
+
+        logger.info("Transcribing audio chunks sequentially...")
+        update_job_status(job_id, "Transcribing")
+        try:
+            results = sequential_transcribe_chunks(audio_chunks, job_id)
+            logger.info("Sequential transcription of all chunks complete")
+        except Exception as e:
+            logger.error(f"Error during transcription: {str(e)}")
+            raise
 
         # Combine results from all chunks
         combined_segments = []
@@ -316,19 +388,34 @@ def process_audio(job_id, filename):
         }
         
         # Create and upload SRT content
-        srt_content = create_srt_content(combined_result["segments"])
-        srt_filename = f"{os.path.splitext(filename)[0]}.srt"
-        upload_string_to_s3(srt_content, srt_filename)
-        
+        update_job_status(job_id, "Creating SRT")
+        try:
+            srt_content = create_srt_content(combined_result["segments"])
+            srt_filename = f"{os.path.splitext(filename)[0]}.srt"
+            upload_string_to_s3(srt_content, srt_filename)
+        except Exception as e:
+            logger.error(f"Error creating or uploading SRT: {str(e)}")
+            raise
+
         # Create and upload full transcription
-        full_transcription = "\n".join([f"[{format_timestamp(seg['start'])} - {format_timestamp(seg['end'])}] {seg['text']}" for seg in combined_result["segments"]])
-        transcription_filename = f"{os.path.splitext(filename)[0]}_transcription.txt"
-        upload_string_to_s3(full_transcription, transcription_filename)
-        
+        update_job_status(job_id, "Creating full transcription")
+        try:
+            full_transcription = "\n".join([f"[{format_timestamp(seg['start'])} - {format_timestamp(seg['end'])}] {seg['text']}" for seg in combined_result["segments"]])
+            transcription_filename = f"{os.path.splitext(filename)[0]}_transcription.txt"
+            upload_string_to_s3(full_transcription, transcription_filename)
+        except Exception as e:
+            logger.error(f"Error creating or uploading full transcription: {str(e)}")
+            raise
+
         # Generate and upload analysis report
-        report = generate_analysis_report(combined_result, total_duration)
-        report_filename = f"{os.path.splitext(filename)[0]}_report.txt"
-        upload_string_to_s3(report, report_filename)
+        update_job_status(job_id, "Generating analysis report")
+        try:
+            report = generate_analysis_report(combined_result, total_duration)
+            report_filename = f"{os.path.splitext(filename)[0]}_report.txt"
+            upload_string_to_s3(report, report_filename)
+        except Exception as e:
+            logger.error(f"Error generating or uploading analysis report: {str(e)}")
+            raise
 
         logger.info("Cleaning up temporary files...")
         os.unlink(audio_path)
@@ -351,6 +438,15 @@ def process_audio(job_id, filename):
         logger.error(f"An error occurred in process_audio: {str(e)}")
         jobs[job_id] = {'status': 'failed', 'error': str(e)}
         send_webhook_alert(job_id, 'failed', {'error': str(e)})
+
+def update_job_status(job_id, status):
+    if job_id in jobs:
+        jobs[job_id]['status'] = status
+        logger.info(f"Job {job_id} status updated: {status}")
+    else:
+        logger.error(f"Attempted to update status for non-existent job {job_id}")
+    # Optionally, you could send a webhook update here as well
+    
         
 def upload_string_to_s3(content, filename):
     with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_file:
