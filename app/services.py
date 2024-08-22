@@ -9,6 +9,7 @@ import subprocess
 import numpy as np
 import soundfile as sf
 import torch
+import concurrent.futures
 from urllib.error import URLError
 from pydub import AudioSegment
 from pydub.silence import detect_silence
@@ -158,6 +159,45 @@ def generate_analysis_report(analysis):
 
     return report
 
+def split_audio_file(audio_path, chunk_duration=300):  # chunk_duration in seconds (5 minutes)
+    audio = AudioSegment.from_wav(audio_path)
+    total_duration = len(audio) / 1000  # Duration in seconds
+    chunks = []
+
+    for i in range(0, int(total_duration), chunk_duration):
+        start = i * 1000  # pydub works with milliseconds
+        end = (i + chunk_duration) * 1000
+        chunk = audio[start:end]
+        
+        chunk_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+        chunk.export(chunk_file.name, format="wav")
+        chunks.append(chunk_file.name)
+
+    return chunks, total_duration
+def transcribe_chunk(model, chunk_path, chunk_index, total_chunks):
+    logger.info(f"Transcribing chunk {chunk_index+1}/{total_chunks}")
+    result = model.transcribe(chunk_path)
+    os.unlink(chunk_path)  # Remove the chunk file after processing
+    return result
+
+def parallel_transcribe_chunks(model, audio_chunks):
+    total_chunks = len(audio_chunks)
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_to_chunk = {executor.submit(transcribe_chunk, model, chunk, i, total_chunks): i 
+                           for i, chunk in enumerate(audio_chunks)}
+        results = []
+        for future in concurrent.futures.as_completed(future_to_chunk):
+            chunk_index = future_to_chunk[future]
+            try:
+                result = future.result()
+                results.append((chunk_index, result))
+            except Exception as exc:
+                logger.error(f"Chunk {chunk_index} generated an exception: {exc}")
+    
+    # Sort results by chunk index to maintain correct order
+    results.sort(key=lambda x: x[0])
+    return [r[1] for r in results]
+
 def process_audio(job_id, filename):
     try:
         file_url = get_public_url(filename)
@@ -206,6 +246,10 @@ def process_audio(job_id, filename):
                 temp_wav_file.write(file_stream.getvalue())
                 audio_path = temp_wav_file.name
         
+        logger.info("Splitting audio file into chunks...")
+        audio_chunks, total_duration = split_audio_file(audio_path)
+        logger.info(f"Audio file split into {len(audio_chunks)} chunks")
+
         logger.info("Loading Whisper model...")
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Using device: {device}")
@@ -216,11 +260,26 @@ def process_audio(job_id, filename):
             logger.error(f"Error loading Whisper model: {str(e)}")
             raise Exception(f"Failed to load Whisper model: {str(e)}")
 
-        logger.info("Transcribing audio...")
-        result = model.transcribe(audio_path)
-        logger.info("Transcription complete")
+        logger.info("Transcribing audio chunks in parallel...")
+        results = parallel_transcribe_chunks(model, audio_chunks)
+        logger.info("Parallel transcription of all chunks complete")
+
+        # Combine results from all chunks
+        combined_segments = []
+        time_offset = 0
+        for result in results:
+            for segment in result["segments"]:
+                segment["start"] += time_offset
+                segment["end"] += time_offset
+                combined_segments.append(segment)
+            time_offset += result["segments"][-1]["end"] if result["segments"] else 0
+
+        combined_result = {
+            "text": " ".join(result["text"] for result in results),
+            "segments": combined_segments
+        }
         
-        srt_content = create_srt_content(result["segments"])
+        srt_content = create_srt_content(combined_result["segments"])
         
         srt_filename = f"{os.path.splitext(filename)[0]}.srt"
         with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.srt') as temp_srt_file:
@@ -231,7 +290,7 @@ def process_audio(job_id, filename):
         upload_file(temp_srt_path, srt_filename)
         
         transcription_with_timestamps = []
-        for segment in result["segments"]:
+        for segment in combined_result["segments"]:
             start_time = format_timestamp(segment["start"])
             end_time = format_timestamp(segment["end"])
             text = segment["text"]
@@ -251,12 +310,8 @@ def process_audio(job_id, filename):
         silent_parts = analyze_audio_silence(audio_path)
         logger.info("Audio silence analysis complete")
         
-        logger.info("Getting audio duration...")
-        total_duration = get_audio_duration(audio_path)
-        logger.info(f"Audio duration: {total_duration} seconds")
-        
         logger.info("Combining analyses...")
-        analysis_result = combine_analyses(result, silent_parts, total_duration)
+        analysis_result = combine_analyses(combined_result, silent_parts, total_duration)
         logger.info("Analysis combination complete")
         
         logger.info("Generating analysis report...")
@@ -299,7 +354,8 @@ def process_audio(job_id, filename):
         logger.info(f"Job {job_id} failed. Sending webhook alert.")
         send_webhook_alert(job_id, 'failed', {'error': str(e)})
         logger.info(f"Webhook alert sent for failed job {job_id}")
-
+        
+        
 def send_webhook_alert(job_id, status, result=None):
     if not WEBHOOK_URL:
         logger.warning(f"Webhook URL not set. Skipping webhook alert for job {job_id}.")
