@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, render_template, request, jsonify
 import threading
 import os
 import uuid
@@ -14,6 +14,10 @@ logger = configure_logging()
 app = Flask(__name__)
 
 jobs = {}
+
+@app.route('/')
+def index():
+    return render_template('upload.html')
 
 @app.route('/upload', methods=['POST'])
 def upload():

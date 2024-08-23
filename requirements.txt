@@ -14,3 +14,4 @@ minio==7.2.8
 yt-dlp==2023.7.6
 soundfile
 ffmpeg-python
+flask-cors==3.0.10
