@@ -3,6 +3,7 @@ import threading
 import os
 import uuid
 import subprocess
+import json
 from app.services import process_audio
 from app.utils import configure_logging
 import tempfile
@@ -28,25 +29,32 @@ def scale_video(input_path, output_path, target_size):
         # Get video information
         logger.debug("Probing video file for information...")
         probe_command = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', input_path]
-        probe_output = subprocess.check_output(probe_command, universal_newlines=True)
-        video_info = json.loads(probe_output)
-        logger.debug(f"Video info: {json.dumps(video_info, indent=2)}")
-        
+        try:
+            probe_output = subprocess.check_output(probe_command, universal_newlines=True)
+            video_info = json.loads(probe_output)
+            logger.debug(f"Video info: {json.dumps(video_info, indent=2)}")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error probing video file: {e}")
+            raise
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing video info JSON: {e}")
+            raise
+
         # Calculate scaling factor
         original_size = os.path.getsize(input_path)
         scale_factor = (target_size / original_size) ** 0.5
         logger.info(f"Original size: {original_size / (1024 * 1024):.2f} MiB, Scale factor: {scale_factor:.2f}")
-        
+
         # Get original resolution
         width = int(video_info['streams'][0]['width'])
         height = int(video_info['streams'][0]['height'])
         logger.info(f"Original resolution: {width}x{height}")
-        
+
         # Calculate new resolution
         new_width = int(width * scale_factor)
         new_height = int(height * scale_factor)
         logger.info(f"New resolution: {new_width}x{new_height}")
-        
+
         ffmpeg_command = [
             'ffmpeg',
             '-i', input_path,
@@ -58,12 +66,12 @@ def scale_video(input_path, output_path, target_size):
             '-y',
             output_path
         ]
-        
+
         logger.debug(f"FFmpeg command: {' '.join(ffmpeg_command)}")
         logger.info("Starting FFmpeg encoding process...")
-        
+
         process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-        
+
         # Log FFmpeg output in real-time
         while True:
             output = process.stderr.readline()
@@ -71,18 +79,20 @@ def scale_video(input_path, output_path, target_size):
                 break
             if output:
                 logger.debug(output.strip())
-        
+
         rc = process.poll()
         if rc != 0:
             logger.error(f"FFmpeg process failed with return code {rc}")
             raise subprocess.CalledProcessError(rc, ffmpeg_command)
-        
+
         new_size = os.path.getsize(output_path)
         logger.info(f"Video scaled successfully. New size: {new_size / (1024 * 1024):.2f} MiB")
     except subprocess.CalledProcessError as e:
-        logger.error(f"Error scaling video: {e}")
+        logger.exception(f"Error in subprocess call: {e}")
         raise
-
+    except Exception as e:
+        logger.exception(f"Unexpected error in scale_video: {e}")
+        raise
 
 @app.route('/')
 def index():
@@ -101,7 +111,7 @@ def upload():
         logger.error("No selected file")
         return jsonify({'error': 'No selected file'}), 400
 
-    if file and allowed_file(file.filename):
+    if file:
         filename = secure_filename(file.filename)
         logger.info(f"Processing file: {filename}")
         
@@ -112,6 +122,7 @@ def upload():
         file_size = os.path.getsize(temp_file_path)
         logger.info(f"Received file: {filename}, Size: {file_size / (1024 * 1024):.2f} MiB")
 
+        MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MiB
         if file_size > MAX_FILE_SIZE:
             logger.info(f"File size exceeds {MAX_FILE_SIZE / (1024 * 1024)} MiB. Scaling down.")
             try:
@@ -122,8 +133,8 @@ def upload():
                 temp_file_path = scaled_file_path  # Use scaled file for upload
                 logger.info(f"Scaled file size: {os.path.getsize(temp_file_path) / (1024 * 1024):.2f} MiB")
             except Exception as e:
-                logger.error(f"Error scaling video: {str(e)}")
-                return jsonify({'error': 'Error processing video'}), 500
+                logger.exception(f"Error scaling video: {str(e)}")
+                return jsonify({'error': f'Error processing video: {str(e)}'}), 500
 
         try:
             logger.info(f"Uploading file to MinIO: {filename}")
@@ -132,17 +143,17 @@ def upload():
             logger.info(f"File uploaded successfully: {file_url}")
             return jsonify({'message': 'File uploaded successfully', 'file_url': file_url}), 200
         except Exception as e:
-            logger.error(f"Error uploading file to MinIO: {str(e)}")
-            return jsonify({'error': 'Error uploading file'}), 500
+            logger.exception(f"Error uploading file to MinIO: {str(e)}")
+            return jsonify({'error': f'Error uploading file: {str(e)}'}), 500
         finally:
             if os.path.exists(temp_file_path):
                 logger.debug(f"Removing temporary file: {temp_file_path}")
                 os.remove(temp_file_path)
                 logger.info("Temporary file removed")
     else:
-        logger.error(f"Invalid file type: {file.filename}")
-        return jsonify({'error': 'Invalid file type'}), 400
-                        
+        logger.error(f"Invalid file: {file.filename}")
+        return jsonify({'error': 'Invalid file'}), 400
+    
 @app.route('/convert_and_transcribe', methods=['POST'])
 @authenticate
 def convert_and_transcribe():
