@@ -1,19 +1,18 @@
 import os
-import io
 import tempfile
 import boto3
 from botocore.client import Config
 import whisper
 import requests
 import subprocess
+import json
 import torch
+import tempfile
 from pydub import AudioSegment
 from pydub.silence import detect_silence
 from app.utils import configure_logging, jobs
-from config.settings import S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY, WEBHOOK_URL
-
+from config.settings import S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY, WEBHOOK_URL, MAX_FILE_SIZE, API_KEY
 logger = configure_logging()
-
 s3_client = boto3.client('s3',
                          endpoint_url=S3_ENDPOINT,
                          aws_access_key_id=S3_ACCESS_KEY,
@@ -50,25 +49,169 @@ def upload_file(file_path, object_name):
         logger.error(f"Upload error: {e}")
         raise
 
+def process_upload(file, filename):
+    temp_file_path = os.path.join(tempfile.gettempdir(), filename)
+    logger.debug(f"Saving file to temporary location: {temp_file_path}")
+    file.save(temp_file_path)
+
+    file_size = os.path.getsize(temp_file_path)
+    logger.info(f"Received file: {filename}, Size: {file_size / (1024 * 1024):.2f} MiB")
+
+    if file_size > MAX_FILE_SIZE:
+        logger.info(f"File size exceeds {MAX_FILE_SIZE / (1024 * 1024)} MiB. Scaling down.")
+        try:
+            scaled_file_path = os.path.join(tempfile.gettempdir(), f"scaled_{filename}")
+            scale_video(temp_file_path, scaled_file_path, MAX_FILE_SIZE)
+            logger.debug(f"Removing original file: {temp_file_path}")
+            os.remove(temp_file_path)  # Remove original file
+            temp_file_path = scaled_file_path  # Use scaled file for upload
+            logger.info(f"Scaled file size: {os.path.getsize(temp_file_path) / (1024 * 1024):.2f} MiB")
+        except subprocess.CalledProcessError as e:
+            logger.exception(f"Error scaling video: {str(e)}")
+            raise
+        except Exception as e:
+            logger.exception(f"Unexpected error scaling video: {str(e)}")
+            raise
+
+    try:
+        logger.info(f"Uploading file to S3: {filename}")
+        upload_file(temp_file_path, filename)
+        file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{filename}"
+        logger.info(f"File uploaded successfully: {file_url}")
+        return file_url
+    except Exception as e:
+        logger.exception(f"Error uploading file to S3: {str(e)}")
+        raise
+    finally:
+        if os.path.exists(temp_file_path):
+            logger.debug(f"Removing temporary file: {temp_file_path}")
+            os.remove(temp_file_path)
+            logger.info("Temporary file removed")
+            
+import os
+import tempfile
+import subprocess
+import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+def scale_video(input_path, output_path, target_size):
+    logger.info(f"Starting video scaling process: {input_path} -> {output_path}")
+    temp_file1 = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+    temp_file2 = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+    current_input = input_path
+    current_output = temp_file1
+
+    max_iterations = 10  # Maximum number of scaling iterations
+    iteration = 0
+
+    try:
+        while iteration < max_iterations:
+            iteration += 1
+
+            # Get video information
+            logger.debug(f"Probing video file for information: {current_input}")
+            probe_command = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', current_input]
+            try:
+                probe_output = subprocess.check_output(probe_command, universal_newlines=True)
+                video_info = json.loads(probe_output)
+                logger.debug(f"Video info: {json.dumps(video_info, indent=2)}")
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Error probing video file: {e}")
+                raise
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing video info JSON: {e}")
+                raise
+
+            # Calculate scaling factor
+            original_size = os.path.getsize(current_input)
+            scale_factor = min((target_size / original_size) ** 0.5, 0.75)  # Increase scaling factor to 75% per pass
+            logger.info(f"Current size: {original_size / (1024 * 1024):.2f} MiB, Scale factor: {scale_factor:.2f}")
+
+            # Get original resolution
+            width = int(video_info['streams'][0]['width'])
+            height = int(video_info['streams'][0]['height'])
+            logger.info(f"Current resolution: {width}x{height}")
+
+            # Calculate new resolution
+            new_width = max(int(width * scale_factor), 480)  # Minimum width of 480
+            new_height = max(int(height * scale_factor), 270)  # Minimum height of 270
+            logger.info(f"New resolution: {new_width}x{new_height}")
+
+            # Calculate new video bitrate
+            original_bitrate = int(video_info['streams'][0]['bit_rate'])
+            new_bitrate = int(original_bitrate * scale_factor)
+            logger.info(f"Current bitrate: {original_bitrate}, New bitrate: {new_bitrate}")
+
+            ffmpeg_command = [
+                'ffmpeg',
+                '-i', current_input,
+                '-vf', f'scale={new_width}:{new_height}',
+                '-c:v', 'libx264',
+                '-b:v', f'{new_bitrate}k',  # Set new video bitrate
+                '-preset', 'slow',  # Use slower preset for better compression
+                '-crf', '28',  # Adjust CRF value for better compression
+                '-c:a', 'aac',
+                '-b:a', '128k',  # Maintain constant audio bitrate
+                '-movflags', '+faststart',
+                '-f', 'mp4',
+                '-y',
+                current_output
+            ]
+
+            logger.debug(f"FFmpeg command: {' '.join(ffmpeg_command)}")
+            logger.info("Starting FFmpeg encoding process...")
+
+            process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+            # Log FFmpeg output in real-time
+            while True:
+                output = process.stderr.readline()
+                if output == '' and process.poll() is not None:
+                    break
+                if output:
+                    logger.debug(output.strip())
+
+            rc = process.poll()
+            if rc != 0:
+                stderr = process.stderr.read()
+                logger.error(f"FFmpeg process failed with return code {rc}")
+                logger.error(f"FFmpeg error output: {stderr}")
+                raise subprocess.CalledProcessError(rc, ffmpeg_command, stderr)
+
+            new_size = os.path.getsize(current_output)
+            logger.info(f"Scaled video size: {new_size / (1024 * 1024):.2f} MiB")
+
+            if new_size <= target_size:
+                logger.info("Target size reached. Scaling complete.")
+                os.rename(current_output, output_path)
+                break
+            else:
+                logger.info("File still too large. Continuing to scale.")
+                current_input, current_output = current_output, (temp_file2 if current_output == temp_file1 else temp_file1)
+
+        if iteration >= max_iterations:
+            logger.warning("Maximum iterations reached. Stopping scaling process.")
+            os.rename(current_output, output_path)
+
+    except Exception as e:
+        logger.exception(f"Error in scale_video: {str(e)}")
+        raise
+    finally:
+        # Clean up temporary files
+        for temp_file in [temp_file1, temp_file2]:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        logger.info("Temporary files cleaned up")
+
+    logger.info(f"Video scaling complete. Final size: {os.path.getsize(output_path) / (1024 * 1024):.2f} MiB")
+    
 def format_timestamp(seconds):
     milliseconds = int((seconds - int(seconds)) * 1000)
     hours, seconds = divmod(int(seconds), 3600)
     minutes, seconds = divmod(seconds, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
-
-def get_file_size_from_s3(s3_client, bucket, key):
-    try:
-        response = s3_client.head_object(Bucket=bucket, Key=key)
-        return response['ContentLength']
-    except ClientError as e:
-        error_code = e.response['Error']['Code']
-        if error_code == '403':
-            logger.error(f"Access denied to file '{key}' in bucket '{bucket}'. Check file permissions.")
-        elif error_code == '404':
-            logger.error(f"File '{key}' not found in bucket '{bucket}'. Check the file name and path.")
-        else:
-            logger.error(f"Error accessing file in S3: {str(e)}")
-        raise
 
 def scale_video_if_needed(input_file, output_file, target_size_mb=25):
     """Scale the video if it's larger than the target size."""
