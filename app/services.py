@@ -91,42 +91,56 @@ def process_upload(file, filename):
 def scale_video(input_path, output_path, target_size):
     logger.info(f"Starting video scaling process: {input_path} -> {output_path}")
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
-    current_input = input_path
 
     try:
         # Get video information
-        probe_command = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', current_input]
+        probe_command = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', input_path]
         probe_output = subprocess.check_output(probe_command, universal_newlines=True)
         video_info = json.loads(probe_output)
 
         # Calculate target bitrate
         duration = float(video_info['format']['duration'])
-        target_bitrate = int((target_size * 8) / duration * 0.95)  # 95% of the target size for video
+        target_total_bitrate = int((target_size * 8) / duration * 0.95)  # 95% of the target size for video+audio
 
-        # Set a minimum bitrate to ensure some video quality
-        min_bitrate = 100000  # 100 kbps
-        target_bitrate = max(target_bitrate, min_bitrate)
+        # Allocate bitrate for video and audio
+        target_video_bitrate = int(target_total_bitrate * 0.95)  # 95% for video
+        target_audio_bitrate = int(target_total_bitrate * 0.05)  # 5% for audio
 
-        # Calculate new resolution (reduced by half)
-        width = int(int(video_info['streams'][0]['width']) / 2)
-        height = int(int(video_info['streams'][0]['height']) / 2)
+        # Set minimum bitrates
+        min_video_bitrate = 100000  # 100 kbps
+        min_audio_bitrate = 32000   # 32 kbps
+        target_video_bitrate = max(target_video_bitrate, min_video_bitrate)
+        target_audio_bitrate = max(target_audio_bitrate, min_audio_bitrate)
+
+        # Calculate new resolution
+        original_width = int(video_info['streams'][0]['width'])
+        original_height = int(video_info['streams'][0]['height'])
+        aspect_ratio = original_width / original_height
+
+        # Try to maintain aspect ratio while reducing resolution
+        if aspect_ratio > 1:  # Landscape
+            new_width = min(original_width, 854)  # Max width of 854 (480p)
+            new_height = int(new_width / aspect_ratio)
+        else:  # Portrait
+            new_height = min(original_height, 854)  # Max height of 854
+            new_width = int(new_height * aspect_ratio)
 
         # Ensure even dimensions
-        width = width - (width % 2)
-        height = height - (height % 2)
+        new_width = new_width - (new_width % 2)
+        new_height = new_height - (new_height % 2)
 
         ffmpeg_command = [
             'ffmpeg',
-            '-i', current_input,
-            '-vf', f'scale={width}:{height}',
+            '-i', input_path,
+            '-vf', f'scale={new_width}:{new_height}',
             '-c:v', 'libx264',
-            '-b:v', f'{target_bitrate}',
-            '-maxrate', f'{target_bitrate}',
-            '-bufsize', f'{target_bitrate*2}',
-            '-preset', 'slow',
+            '-b:v', f'{target_video_bitrate}',
+            '-maxrate', f'{target_video_bitrate}',
+            '-bufsize', f'{target_video_bitrate*2}',
+            '-preset', 'slower',  # Use 'slower' preset for better compression
             '-crf', '23',
             '-c:a', 'aac',
-            '-b:a', '128k',
+            '-b:a', f'{target_audio_bitrate}',
             '-movflags', '+faststart',
             '-y',
             temp_file
@@ -159,8 +173,30 @@ def scale_video(input_path, output_path, target_size):
             logger.info("Target size reached. Scaling complete.")
             os.rename(temp_file, output_path)
         else:
-            logger.warning(f"File still too large ({new_size / (1024 * 1024):.2f} MiB). Further compression may be needed.")
-            os.rename(temp_file, output_path)
+            logger.warning(f"File still too large ({new_size / (1024 * 1024):.2f} MiB). Attempting further compression.")
+            
+            # If still too large, try one more pass with more aggressive settings
+            ffmpeg_command = [
+                'ffmpeg',
+                '-i', temp_file,
+                '-c:v', 'libx264',
+                '-b:v', f'{target_video_bitrate * 0.8}',  # Reduce bitrate by 20%
+                '-maxrate', f'{target_video_bitrate * 0.8}',
+                '-bufsize', f'{target_video_bitrate * 1.5}',
+                '-preset', 'veryslow',  # Use 'veryslow' preset for maximum compression
+                '-crf', '28',  # Increase CRF for more compression
+                '-c:a', 'aac',
+                '-b:a', f'{target_audio_bitrate}',
+                '-movflags', '+faststart',
+                '-y',
+                output_path
+            ]
+
+            logger.debug(f"Second pass FFmpeg command: {' '.join(ffmpeg_command)}")
+            subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+
+        final_size = os.path.getsize(output_path)
+        logger.info(f"Final video size: {final_size / (1024 * 1024):.2f} MiB")
 
     except Exception as e:
         logger.exception(f"Error in scale_video: {str(e)}")
@@ -178,46 +214,6 @@ def format_timestamp(seconds):
     hours, seconds = divmod(int(seconds), 3600)
     minutes, seconds = divmod(seconds, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
-
-def scale_video_if_needed(input_file, output_file, target_size_mb=25):
-    """Scale the video if it's larger than the target size."""
-    input_size = os.path.getsize(input_file) / (1024 * 1024)  # Size in MB
-    
-    if input_size <= target_size_mb:
-        # If the file is already small enough, just copy it
-        os.rename(input_file, output_file)
-        return
-    
-    # Calculate the scale factor
-    scale_factor = (target_size_mb / input_size) ** 0.5
-    
-    ffmpeg_command = [
-        'ffmpeg',
-        '-i', input_file,
-        '-vf', f'scale=iw*{scale_factor:.2f}:ih*{scale_factor:.2f}',
-        '-b:v', f'{target_size_mb/2:.0f}M',  # Allocate half the target size to video
-        '-b:a', '128k',
-        '-progress', '-',
-        '-y',
-        output_file
-    ]
-    
-    process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    
-    for line in process.stdout:
-        if 'out_time_ms' in line:
-            try:
-                time_ms = int(line.split('=')[1])
-                progress = (time_ms / 1000000) / get_audio_duration(input_file) * 100
-                logger.info(f"Video conversion progress: {progress:.2f}%")
-            except ValueError:
-                # Skip lines that can't be parsed
-                continue
-    
-    stdout, stderr = process.communicate()
-    
-    if process.returncode != 0:
-        raise Exception(f"FFmpeg error: {stderr}")
 
 def create_srt_content(segments):
     srt_content = ""
@@ -341,38 +337,28 @@ def process_audio(job_id, filename):
     try:
         file_url = get_public_url(filename)
         logger.info(f"Starting process for file: {file_url}")
-        
+
         # Get file size
-        try:
-            file_size_mb = get_file_size_from_public_url(file_url) / (1024 * 1024)
-            logger.info(f"File size: {file_size_mb:.2f} MB")
-        except Exception as e:
-            raise Exception(f"Failed to get file size: {str(e)}")
-        
+        file_size_mb = get_file_size_from_public_url(file_url) / (1024 * 1024)
+        logger.info(f"File size: {file_size_mb:.2f} MB")
+
         # Download the file
-        try:
-            file_content = download_file_from_public_url(file_url)
-        except Exception as e:
-            raise Exception(f"Failed to download file: {str(e)}")
-        
+        file_content = download_file_from_public_url(file_url)
+
         # Process the file content
-        temp_input_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1])
-        temp_files.append(temp_input_file.name)
-        temp_input_file.write(file_content)
-        temp_input_file.close()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_input_file:
+            temp_files.append(temp_input_file.name)
+            temp_input_file.write(file_content)
+
+        # Scale video
+        scaled_video_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+        temp_files.append(scaled_video_path)
         
-        temp_output_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-        temp_files.append(temp_output_file.name)
-        temp_output_file.close()
-        
-        # Scale video if needed
-        logger.info(f"Scaling video if needed: {temp_input_file.name} -> {temp_output_file.name}")
-        scale_video_if_needed(temp_input_file.name, temp_output_file.name)
-        
-        scaled_video_path = temp_output_file.name
-        
+        logger.info(f"Scaling video: {temp_input_file.name} -> {scaled_video_path}")
+        scale_video(temp_input_file.name, scaled_video_path, 25 * 1024 * 1024)  # 25 MiB target size
+
         # Extract audio from the scaled-down video
-        audio_path = tempfile.NamedTemporaryFile(delete=False, suffix='.wav').name
+        audio_path = tempfile.mkstemp(suffix='.wav')[1]
         temp_files.append(audio_path)
         ffmpeg_command = [
             'ffmpeg',
@@ -383,79 +369,65 @@ def process_audio(job_id, filename):
             '-y',
             audio_path
         ]
-        
+
         logger.info(f"Extracting audio: {' '.join(ffmpeg_command)}")
-        process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = process.communicate()
-        
-        if process.returncode != 0:
-            raise Exception(f"FFmpeg error: {stderr.decode()}")
-        
+        subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
+
         logger.info("Loading Whisper model...")
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Using device: {device}")
-        try:
-            model = whisper.load_model("base", device=device)
-            logger.info(f"Whisper model loaded successfully on {device}")
-        except Exception as e:
-            logger.error(f"Error loading Whisper model: {str(e)}")
-            raise Exception(f"Failed to load Whisper model: {str(e)}")
+        model = whisper.load_model("base", device=device)
+        logger.info(f"Whisper model loaded successfully on {device}")
 
         logger.info("Transcribing audio...")
         result = model.transcribe(audio_path)
         logger.info("Transcription complete")
-        
+
         srt_content = create_srt_content(result["segments"])
-        
+
         srt_filename = f"{os.path.splitext(filename)[0]}.srt"
-        temp_srt_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.srt')
-        temp_files.append(temp_srt_file.name)
-        temp_srt_file.write(srt_content)
-        temp_srt_file.close()
-        
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.srt') as temp_srt_file:
+            temp_files.append(temp_srt_file.name)
+            temp_srt_file.write(srt_content)
+
         logger.info(f"Uploading SRT to S3: {srt_filename}")
         upload_file(temp_srt_file.name, srt_filename)
-        
-        transcription_with_timestamps = []
-        for segment in result["segments"]:
-            start_time = format_timestamp(segment["start"])
-            end_time = format_timestamp(segment["end"])
-            text = segment["text"]
-            transcription_with_timestamps.append(f"[{start_time} - {end_time}] {text}")
-        
+
+        transcription_with_timestamps = [
+            f"[{format_timestamp(segment['start'])} - {format_timestamp(segment['end'])}] {segment['text']}"
+            for segment in result["segments"]
+        ]
         full_transcription = "\n".join(transcription_with_timestamps)
-        
+
         transcription_filename = f"{os.path.splitext(filename)[0]}_transcription.txt"
-        temp_transcription_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
-        temp_files.append(temp_transcription_file.name)
-        temp_transcription_file.write(full_transcription)
-        temp_transcription_file.close()
-        
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as temp_transcription_file:
+            temp_files.append(temp_transcription_file.name)
+            temp_transcription_file.write(full_transcription)
+
         logger.info(f"Uploading transcription to S3: {transcription_filename}")
         upload_file(temp_transcription_file.name, transcription_filename)
-        
+
         logger.info("Analyzing audio silence...")
         silent_parts = analyze_audio_silence(audio_path)
         logger.info("Audio silence analysis complete")
-        
+
         logger.info("Getting audio duration...")
         total_duration = get_audio_duration(audio_path)
         logger.info(f"Audio duration: {total_duration} seconds")
-        
+
         logger.info("Combining analyses...")
         analysis_result = combine_analyses(result, silent_parts, total_duration)
         logger.info("Analysis combination complete")
-        
+
         logger.info("Generating analysis report...")
         report = generate_analysis_report(analysis_result)
         logger.info("Analysis report generated")
-        
+
         report_filename = f"{os.path.splitext(filename)[0]}_report.txt"
-        temp_report_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
-        temp_files.append(temp_report_file.name)
-        temp_report_file.write(report)
-        temp_report_file.close()
-        
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as temp_report_file:
+            temp_files.append(temp_report_file.name)
+            temp_report_file.write(report)
+
         logger.info(f"Uploading analysis report to S3: {report_filename}")
         upload_file(temp_report_file.name, report_filename)
 
@@ -472,15 +444,14 @@ def process_audio(job_id, filename):
         logger.info(f"Job {job_id} completed. Sending webhook alert.")
         send_webhook_alert(job_id, 'completed', jobs[job_id]['result'])
         logger.info(f"Webhook alert sent for job {job_id}")
-        
+
     except Exception as e:
         logger.error(f"An error occurred in process_audio: {str(e)}")
         jobs[job_id] = {'status': 'failed', 'error': str(e)}
-        
         logger.info(f"Job {job_id} failed. Sending webhook alert.")
         send_webhook_alert(job_id, 'failed', {'error': str(e)})
         logger.info(f"Webhook alert sent for failed job {job_id}")
-    
+
     finally:
         logger.info("Cleaning up temporary files...")
         for temp_file in temp_files:
@@ -490,8 +461,9 @@ def process_audio(job_id, filename):
             except Exception as e:
                 logger.warning(f"Failed to delete temporary file {temp_file}: {str(e)}")
         logger.info("Temporary files cleanup completed")
-            
-        
+
+    logger.info(f"Process completed for job {job_id}")
+         
 def send_webhook_alert(job_id, status, result=None):
     if not WEBHOOK_URL:
         logger.warning(f"Webhook URL not set. Skipping webhook alert for job {job_id}.")
