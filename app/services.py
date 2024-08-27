@@ -88,121 +88,87 @@ def process_upload(file, filename):
             os.remove(temp_file_path)
             logger.info("Temporary file removed")
             
-import os
-import tempfile
-import subprocess
-import json
-import logging
-
-logger = logging.getLogger(__name__)
-
 def scale_video(input_path, output_path, target_size):
     logger.info(f"Starting video scaling process: {input_path} -> {output_path}")
-    temp_file1 = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
-    temp_file2 = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
     current_input = input_path
-    current_output = temp_file1
-
-    max_iterations = 10  # Maximum number of scaling iterations
-    iteration = 0
 
     try:
-        while iteration < max_iterations:
-            iteration += 1
+        # Get video information
+        probe_command = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', current_input]
+        probe_output = subprocess.check_output(probe_command, universal_newlines=True)
+        video_info = json.loads(probe_output)
 
-            # Get video information
-            logger.debug(f"Probing video file for information: {current_input}")
-            probe_command = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', current_input]
-            try:
-                probe_output = subprocess.check_output(probe_command, universal_newlines=True)
-                video_info = json.loads(probe_output)
-                logger.debug(f"Video info: {json.dumps(video_info, indent=2)}")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Error probing video file: {e}")
-                raise
-            except json.JSONDecodeError as e:
-                logger.error(f"Error parsing video info JSON: {e}")
-                raise
+        # Calculate target bitrate
+        duration = float(video_info['format']['duration'])
+        target_bitrate = int((target_size * 8) / duration * 0.95)  # 95% of the target size for video
 
-            # Calculate scaling factor
-            original_size = os.path.getsize(current_input)
-            scale_factor = min((target_size / original_size) ** 0.5, 0.75)  # Increase scaling factor to 75% per pass
-            logger.info(f"Current size: {original_size / (1024 * 1024):.2f} MiB, Scale factor: {scale_factor:.2f}")
+        # Set a minimum bitrate to ensure some video quality
+        min_bitrate = 100000  # 100 kbps
+        target_bitrate = max(target_bitrate, min_bitrate)
 
-            # Get original resolution
-            width = int(video_info['streams'][0]['width'])
-            height = int(video_info['streams'][0]['height'])
-            logger.info(f"Current resolution: {width}x{height}")
+        # Calculate new resolution (reduced by half)
+        width = int(int(video_info['streams'][0]['width']) / 2)
+        height = int(int(video_info['streams'][0]['height']) / 2)
 
-            # Calculate new resolution
-            new_width = max(int(width * scale_factor), 480)  # Minimum width of 480
-            new_height = max(int(height * scale_factor), 270)  # Minimum height of 270
-            logger.info(f"New resolution: {new_width}x{new_height}")
+        # Ensure even dimensions
+        width = width - (width % 2)
+        height = height - (height % 2)
 
-            # Calculate new video bitrate
-            original_bitrate = int(video_info['streams'][0]['bit_rate'])
-            new_bitrate = int(original_bitrate * scale_factor)
-            logger.info(f"Current bitrate: {original_bitrate}, New bitrate: {new_bitrate}")
+        ffmpeg_command = [
+            'ffmpeg',
+            '-i', current_input,
+            '-vf', f'scale={width}:{height}',
+            '-c:v', 'libx264',
+            '-b:v', f'{target_bitrate}',
+            '-maxrate', f'{target_bitrate}',
+            '-bufsize', f'{target_bitrate*2}',
+            '-preset', 'slow',
+            '-crf', '23',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', '+faststart',
+            '-y',
+            temp_file
+        ]
 
-            ffmpeg_command = [
-                'ffmpeg',
-                '-i', current_input,
-                '-vf', f'scale={new_width}:{new_height}',
-                '-c:v', 'libx264',
-                '-b:v', f'{new_bitrate}k',  # Set new video bitrate
-                '-preset', 'slow',  # Use slower preset for better compression
-                '-crf', '28',  # Adjust CRF value for better compression
-                '-c:a', 'aac',
-                '-b:a', '128k',  # Maintain constant audio bitrate
-                '-movflags', '+faststart',
-                '-f', 'mp4',
-                '-y',
-                current_output
-            ]
+        logger.debug(f"FFmpeg command: {' '.join(ffmpeg_command)}")
+        logger.info("Starting FFmpeg encoding process...")
 
-            logger.debug(f"FFmpeg command: {' '.join(ffmpeg_command)}")
-            logger.info("Starting FFmpeg encoding process...")
+        process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 
-            process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-
-            # Log FFmpeg output in real-time
-            while True:
-                output = process.stderr.readline()
-                if output == '' and process.poll() is not None:
-                    break
-                if output:
-                    logger.debug(output.strip())
-
-            rc = process.poll()
-            if rc != 0:
-                stderr = process.stderr.read()
-                logger.error(f"FFmpeg process failed with return code {rc}")
-                logger.error(f"FFmpeg error output: {stderr}")
-                raise subprocess.CalledProcessError(rc, ffmpeg_command, stderr)
-
-            new_size = os.path.getsize(current_output)
-            logger.info(f"Scaled video size: {new_size / (1024 * 1024):.2f} MiB")
-
-            if new_size <= target_size:
-                logger.info("Target size reached. Scaling complete.")
-                os.rename(current_output, output_path)
+        # Log FFmpeg output in real-time
+        while True:
+            output = process.stderr.readline()
+            if output == '' and process.poll() is not None:
                 break
-            else:
-                logger.info("File still too large. Continuing to scale.")
-                current_input, current_output = current_output, (temp_file2 if current_output == temp_file1 else temp_file1)
+            if output:
+                logger.debug(output.strip())
 
-        if iteration >= max_iterations:
-            logger.warning("Maximum iterations reached. Stopping scaling process.")
-            os.rename(current_output, output_path)
+        rc = process.poll()
+        if rc != 0:
+            stderr = process.stderr.read()
+            logger.error(f"FFmpeg process failed with return code {rc}")
+            logger.error(f"FFmpeg error output: {stderr}")
+            raise subprocess.CalledProcessError(rc, ffmpeg_command, stderr)
+
+        new_size = os.path.getsize(temp_file)
+        logger.info(f"Scaled video size: {new_size / (1024 * 1024):.2f} MiB")
+
+        if new_size <= target_size:
+            logger.info("Target size reached. Scaling complete.")
+            os.rename(temp_file, output_path)
+        else:
+            logger.warning(f"File still too large ({new_size / (1024 * 1024):.2f} MiB). Further compression may be needed.")
+            os.rename(temp_file, output_path)
 
     except Exception as e:
         logger.exception(f"Error in scale_video: {str(e)}")
         raise
     finally:
-        # Clean up temporary files
-        for temp_file in [temp_file1, temp_file2]:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
+        # Clean up temporary file
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
         logger.info("Temporary files cleaned up")
 
     logger.info(f"Video scaling complete. Final size: {os.path.getsize(output_path) / (1024 * 1024):.2f} MiB")
