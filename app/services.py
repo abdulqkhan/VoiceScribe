@@ -9,6 +9,7 @@ import json
 import torch
 import tempfile
 from pydub import AudioSegment
+from difflib import SequenceMatcher
 from pydub.silence import detect_silence
 from app.utils import configure_logging, jobs
 from config.settings import S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY, WEBHOOK_URL, MAX_FILE_SIZE, API_KEY
@@ -228,7 +229,7 @@ def get_audio_duration(audio_file_path):
     audio = AudioSegment.from_file(audio_file_path)
     return len(audio) / 1000.0
 
-def analyze_audio_silence(audio_file, min_silence_len=1000, silence_thresh=-40):
+def analyze_audio_silence(audio_file, min_silence_len=2000, silence_thresh=-35):
     audio = AudioSegment.from_file(audio_file)
     silent_parts = detect_silence(audio, min_silence_len=min_silence_len, silence_thresh=silence_thresh)
     return [(start/1000, end/1000) for start, end in silent_parts]
@@ -240,7 +241,7 @@ def combine_analyses(whisper_result, silent_parts, total_duration):
         'silent_parts': [],
         'transcribed_segments': [],
         'repeated_sentences': [],
-        'flagged_for_deletion': []
+        'flagged_for_review': []
     }
     
     current_time = 0
@@ -248,15 +249,17 @@ def combine_analyses(whisper_result, silent_parts, total_duration):
     segment_text_map = {}
     
     for segment in whisper_result['segments']:
-        # Add silent parts before the current segment
+        # Silent parts detection (unchanged)
         while silent_parts_index < len(silent_parts) and silent_parts[silent_parts_index][1] <= segment['start']:
             start, end = silent_parts[silent_parts_index]
             if start > current_time:
-                analysis['silent_parts'].append({
-                    'start': format_timestamp(start),
-                    'end': format_timestamp(end),
-                    'duration': round(end - start, 2)
-                })
+                duration = end - start
+                if duration >= 2:
+                    analysis['silent_parts'].append({
+                        'start': format_timestamp(start),
+                        'end': format_timestamp(end),
+                        'duration': round(duration, 2)
+                    })
             current_time = end
             silent_parts_index += 1
         
@@ -269,35 +272,34 @@ def combine_analyses(whisper_result, silent_parts, total_duration):
         analysis['transcribed_segments'].append(segment_info)
         current_time = segment['end']
         
-        # Track repeated sentences
-        text = segment_info['text']
-        if text in segment_text_map:
-            segment_text_map[text].append(segment_info)
+        # Track similar sentences
+        for prev_text, prev_occurrences in segment_text_map.items():
+            similarity = SequenceMatcher(None, segment_info['text'].lower(), prev_text.lower()).ratio()
+            if similarity > 0.7:  # Adjust this threshold as needed
+                prev_occurrences.append(segment_info)
+                break
         else:
-            segment_text_map[text] = [segment_info]
+            segment_text_map[segment_info['text']] = [segment_info]
     
-    # Add remaining silent parts
-    while silent_parts_index < len(silent_parts):
-        start, end = silent_parts[silent_parts_index]
-        if start > current_time:
-            analysis['silent_parts'].append({
-                'start': format_timestamp(start),
-                'end': format_timestamp(end),
-                'duration': round(end - start, 2)
-            })
-        current_time = end
-        silent_parts_index += 1
-    
-    # Identify repeated sentences
+    # Identify repeated or similar sentences
     for text, occurrences in segment_text_map.items():
         if len(occurrences) > 1:
             analysis['repeated_sentences'].append(occurrences)
     
-    # Specific phrase detection
-    specific_phrases = ["cut","bad take","redo"]
-    for phrase in specific_phrases:
-        if phrase in segment_text_map:
-            analysis['repeated_sentences'].append(segment_text_map[phrase])
+    # Flag segments for review
+    filler_words = ["um", "uh", "er", "ah", "like", "you know"]
+    for i, segment in enumerate(analysis['transcribed_segments']):
+        text = segment['text'].lower()
+        
+        # Check for filler words
+        if any(word in text.split() for word in filler_words):
+            analysis['flagged_for_review'].append({'reason': 'Filler words', 'segment': segment})
+        
+        # Check for hesitations or corrections
+        if i > 0:
+            prev_text = analysis['transcribed_segments'][i-1]['text'].lower()
+            if text.startswith(prev_text[:10]):  # Check if this segment starts similarly to the previous one
+                analysis['flagged_for_review'].append({'reason': 'Possible correction', 'segment': segment})
     
     return analysis
 
@@ -308,27 +310,31 @@ def generate_analysis_report(analysis):
     report += f"Total Segments: {analysis['total_segments']}\n\n"
 
     if analysis['silent_parts']:
-        report += f"Silent Parts (>1 second):\n"
-        for i, silent in enumerate(analysis['silent_parts']):
-            if i == 0 and silent['start'] == "00:00:00,000":
-                report += f"  - Initial silence: [{silent['start']} - {silent['end']}] Duration: {silent['duration']} seconds\n"
-            else:
-                report += f"  - [{silent['start']} - {silent['end']}] Duration: {silent['duration']} seconds\n"
-        report += "\n"
+        report += f"Silent Parts (>2 seconds):\n"
+        for i, silent in enumerate(analysis['silent_parts'], 1):
+            report += f"  {i}. [{silent['start']} - {silent['end']}] Duration: {silent['duration']} seconds\n"
+        report += f"\nTotal silent parts: {len(analysis['silent_parts'])}\n\n"
+    else:
+        report += "No significant silent parts detected.\n\n"
 
     if analysis['repeated_sentences']:
-        report += f"Repeated Sentences:\n"
-        for repeat in analysis['repeated_sentences']:
-            report += f"  - '{repeat[0]['text']}' (Repeated {len(repeat)} times)\n"
+        report += f"Similar or Repeated Sentences:\n"
+        for i, repeat in enumerate(analysis['repeated_sentences'], 1):
+            report += f"  {i}. Similar phrases found {len(repeat)} times:\n"
             for occur in repeat:
-                report += f"    [{occur['start']} - {occur['end']}]\n"
-        report += "\n"
+                report += f"    [{occur['start']} - {occur['end']}] {occur['text']}\n"
+        report += f"\nTotal groups of similar sentences: {len(analysis['repeated_sentences'])}\n\n"
+    else:
+        report += "No similar or repeated sentences detected.\n\n"
 
-    if analysis['flagged_for_deletion']:
-        report += f"Segments Flagged for Deletion:\n"
-        for flagged in analysis['flagged_for_deletion']:
-            report += f"  - [{flagged['start']} - {flagged['end']}] {flagged['text']}\n"
-        report += "\n"
+    if analysis['flagged_for_review']:
+        report += f"Segments Flagged for Review:\n"
+        for i, flagged in enumerate(analysis['flagged_for_review'], 1):
+            report += f"  {i}. [{flagged['segment']['start']} - {flagged['segment']['end']}] {flagged['segment']['text']}\n"
+            report += f"     Reason: {flagged['reason']}\n"
+        report += f"\nTotal segments flagged for review: {len(analysis['flagged_for_review'])}\n\n"
+    else:
+        report += "No segments flagged for review.\n\n"
 
     return report
 
