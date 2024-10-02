@@ -15,3 +15,4 @@ yt-dlp==2023.7.6
 soundfile
 ffmpeg-python
 flask-cors==3.0.10
+smart_open[all]

@@ -37,30 +37,34 @@ def check_api_key():
 @authenticate
 def upload():
     logger.info("Upload endpoint called")
+    
+    # Check if the post request has the file part
     if 'file' not in request.files:
         logger.error("No file part in the request")
         return jsonify({'error': 'No file part in the request'}), 400
-
+    
     file = request.files['file']
-
+    
+    # If the user does not select a file, the browser submits an
+    # empty file without a filename.
     if file.filename == '':
         logger.error("No selected file")
         return jsonify({'error': 'No selected file'}), 400
-
-    if file and allowed_file(file.filename):
+    
+    if file:
         filename = secure_filename(file.filename)
-        logger.info(f"Processing file: {filename}")
-
+        logger.info(f"Received file: {filename}")
+        
         try:
             file_url = process_upload(file, filename)
             return jsonify({'message': 'File uploaded successfully', 'file_url': file_url}), 200
         except Exception as e:
-            logger.exception(f"Error uploading file: {str(e)}")
-            return jsonify({'error': f'Error uploading file: {str(e)}'}), 500
-    else:
-        logger.error(f"Invalid file: {file.filename}")
-        return jsonify({'error': 'Invalid file'}), 400
+            logger.error(f"Error processing upload: {str(e)}")
+            return jsonify({'error': f'Error processing upload: {str(e)}'}), 500
     
+    logger.error("Unexpected error in file upload")
+    return jsonify({'error': 'Unexpected error in file upload'}), 500
+
 @app.route('/convert_and_transcribe', methods=['POST'])
 @authenticate
 def convert_and_transcribe():

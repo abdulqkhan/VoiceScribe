@@ -2,6 +2,10 @@ import os
 import tempfile
 import boto3
 from botocore.client import Config
+from botocore.exceptions import ClientError
+from smart_open import open as smart_open
+from werkzeug.utils import secure_filename
+
 import whisper
 import requests
 import subprocess
@@ -11,14 +15,86 @@ import tempfile
 from pydub import AudioSegment
 from difflib import SequenceMatcher
 from pydub.silence import detect_silence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.utils import configure_logging, jobs
 from config.settings import S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY, WEBHOOK_URL, MAX_FILE_SIZE, API_KEY
+
+# Set up logging
 logger = configure_logging()
-s3_client = boto3.client('s3',
-                         endpoint_url=S3_ENDPOINT,
-                         aws_access_key_id=S3_ACCESS_KEY,
-                         aws_secret_access_key=S3_SECRET_KEY,
-                         config=Config(signature_version='s3v4'))
+
+# Constants
+CHUNK_SIZE = 8 * 1024 * 1024  # 8 MB
+MAX_RETRIES = 3
+
+class S3LargeFileUploader:
+    def __init__(self, bucket_name, region_name='us-east-1', use_acceleration=False):
+        self.bucket_name = bucket_name
+        self.s3_client = boto3.client('s3',
+                                      endpoint_url=S3_ENDPOINT,
+                                      aws_access_key_id=S3_ACCESS_KEY,
+                                      aws_secret_access_key=S3_SECRET_KEY,
+                                      region_name=region_name,
+                                      config=Config(signature_version='s3v4', s3={'use_accelerate_endpoint': use_acceleration}))
+
+    def upload_file(self, file_path, object_name=None):
+        if object_name is None:
+            object_name = os.path.basename(file_path)
+
+        try:
+            file_size = os.path.getsize(file_path)
+            mpu = self.s3_client.create_multipart_upload(Bucket=self.bucket_name, Key=object_name)
+            parts = []
+
+            with ThreadPoolExecutor() as executor:
+                futures = []
+
+                with open(file_path, 'rb') as file:
+                    part_number = 1
+                    while True:
+                        data = file.read(CHUNK_SIZE)
+                        if not data:
+                            break
+                        futures.append(
+                            executor.submit(self._upload_part, mpu['UploadId'], object_name, part_number, data)
+                        )
+                        part_number += 1
+
+                for future in as_completed(futures):
+                    part = future.result()
+                    parts.append(part)
+
+            parts.sort(key=lambda x: x['PartNumber'])
+            self.s3_client.complete_multipart_upload(
+                Bucket=self.bucket_name,
+                Key=object_name,
+                UploadId=mpu['UploadId'],
+                MultipartUpload={'Parts': parts}
+            )
+            logger.info(f"File {file_path} uploaded successfully to {self.bucket_name}/{object_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Upload error: {e}")
+            self.s3_client.abort_multipart_upload(Bucket=self.bucket_name, Key=object_name, UploadId=mpu['UploadId'])
+            raise
+
+    def _upload_part(self, upload_id, object_name, part_number, data):
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = self.s3_client.upload_part(
+                    Body=data,
+                    Bucket=self.bucket_name,
+                    Key=object_name,
+                    UploadId=upload_id,
+                    PartNumber=part_number
+                )
+                return {'PartNumber': part_number, 'ETag': response['ETag']}
+            except ClientError as e:
+                logger.warning(f"Error uploading part {part_number}, attempt {attempt + 1}: {str(e)}")
+                if attempt == MAX_RETRIES - 1:
+                    raise
+
+# Initialize the S3LargeFileUploader
+s3_uploader = S3LargeFileUploader(S3_BUCKET)
 
 def get_public_url(filename):
     return f"{S3_ENDPOINT}/{S3_BUCKET}/{filename}"
@@ -44,17 +120,18 @@ def download_file_from_public_url(url):
 def upload_file(file_path, object_name):
     try:
         logger.info(f"Uploading file {file_path} to S3 as {object_name}")
-        s3_client.upload_file(file_path, S3_BUCKET, object_name)
+        s3_uploader.upload_file(file_path, object_name)
         logger.info(f"Upload successful: {object_name}")
     except Exception as e:
         logger.error(f"Upload error: {e}")
         raise
 
 def process_upload(file, filename):
-    temp_file_path = os.path.join(tempfile.gettempdir(), filename)
+    temp_file_path = os.path.join(tempfile.gettempdir(), secure_filename(filename))
     logger.debug(f"Saving file to temporary location: {temp_file_path}")
+    
     file.save(temp_file_path)
-
+    
     file_size = os.path.getsize(temp_file_path)
     logger.info(f"Received file: {filename}, Size: {file_size / (1024 * 1024):.2f} MiB")
 
@@ -76,7 +153,14 @@ def process_upload(file, filename):
 
     try:
         logger.info(f"Uploading file to S3: {filename}")
-        upload_file(temp_file_path, filename)
+        s3_uri = f's3://{S3_BUCKET}/{filename}'
+        session = boto3.Session(
+            aws_access_key_id=S3_ACCESS_KEY,
+            aws_secret_access_key=S3_SECRET_KEY
+        )
+        with open(temp_file_path, 'rb') as local_file:
+            with smart_open(s3_uri, 'wb', transport_params={'client': session.client('s3', endpoint_url=S3_ENDPOINT)}) as s3_file:
+                s3_file.write(local_file.read())
         file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{filename}"
         logger.info(f"File uploaded successfully: {file_url}")
         return file_url
@@ -88,7 +172,8 @@ def process_upload(file, filename):
             logger.debug(f"Removing temporary file: {temp_file_path}")
             os.remove(temp_file_path)
             logger.info("Temporary file removed")
-            
+                    
+
 def scale_video(input_path, output_path, target_size):
     logger.info(f"Starting video scaling process: {input_path} -> {output_path}")
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
@@ -113,12 +198,18 @@ def scale_video(input_path, output_path, target_size):
         target_video_bitrate = max(target_video_bitrate, min_video_bitrate)
         target_audio_bitrate = max(target_audio_bitrate, min_audio_bitrate)
 
-        # Calculate new resolution
-        original_width = int(video_info['streams'][0]['width'])
-        original_height = int(video_info['streams'][0]['height'])
+        # Find the video stream
+        video_stream = next((stream for stream in video_info['streams'] if stream['codec_type'] == 'video'), None)
+        
+        if video_stream is None:
+            raise ValueError("No video stream found in the input file")
+
+        # Get original dimensions, defaulting to 1280x720 if not found
+        original_width = int(video_stream.get('width', 1280))
+        original_height = int(video_stream.get('height', 720))
         aspect_ratio = original_width / original_height
 
-        # Try to maintain aspect ratio while reducing resolution
+        # Calculate new resolution
         if aspect_ratio > 1:  # Landscape
             new_width = min(original_width, 854)  # Max width of 854 (480p)
             new_height = int(new_width / aspect_ratio)
@@ -210,6 +301,7 @@ def scale_video(input_path, output_path, target_size):
 
     logger.info(f"Video scaling complete. Final size: {os.path.getsize(output_path) / (1024 * 1024):.2f} MiB")
     
+
 def format_timestamp(seconds):
     milliseconds = int((seconds - int(seconds)) * 1000)
     hours, seconds = divmod(int(seconds), 3600)
@@ -469,7 +561,7 @@ def process_audio(job_id, filename):
         logger.info("Temporary files cleanup completed")
 
     logger.info(f"Process completed for job {job_id}")
-         
+                  
 def send_webhook_alert(job_id, status, result=None):
     if not WEBHOOK_URL:
         logger.warning(f"Webhook URL not set. Skipping webhook alert for job {job_id}.")

@@ -1,33 +1,41 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>File Upload</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
+
 <body class="bg-gray-100 min-h-screen flex items-center justify-center">
     <div class="max-w-md w-full bg-white rounded-lg shadow-md p-6">
         <h1 class="text-2xl font-bold mb-4 text-center">Upload a File</h1>
         <div id="apiKeySection">
             <div class="mb-4">
                 <label for="apiKey" class="block text-sm font-medium text-gray-700">API Key</label>
-                <input type="password" id="apiKey" name="apiKey" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm">
+                <input type="password" id="apiKey" name="apiKey"
+                    class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm">
             </div>
-            <button type="button" id="submitApiKey" class="w-full py-2 px-4 bg-blue-500 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:ring-opacity-75 transition duration-300">
+            <button type="button" id="submitApiKey"
+                class="w-full py-2 px-4 bg-blue-500 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:ring-opacity-75 transition duration-300">
                 Submit API Key
             </button>
         </div>
         <div id="uploadSection" class="hidden mt-4">
             <form id="uploadForm" enctype="multipart/form-data" class="space-y-4">
-                <div id="dropZone" class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer hover:border-blue-500 transition duration-300">
-                    <svg xmlns="http://www.w3.org/2000/svg" class="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                <div id="dropZone"
+                    class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center cursor-pointer hover:border-blue-500 transition duration-300">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="mx-auto h-12 w-12 text-gray-400" fill="none"
+                        viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                            d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
                     </svg>
                     <p class="mt-2 text-sm text-gray-600">Drag and drop a file here, or click to select</p>
                 </div>
                 <input type="file" name="file" id="fileInput" class="hidden">
-                <button type="submit" class="w-full py-2 px-4 bg-blue-500 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:ring-opacity-75 transition duration-300">
+                <button type="submit"
+                    class="w-full py-2 px-4 bg-blue-500 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-400 focus:ring-opacity-75 transition duration-300">
                     Upload
                 </button>
             </form>
@@ -101,43 +109,59 @@
             dropZone.querySelector('p').textContent = fileName || 'Drag and drop a file here, or click to select';
         }
 
-        uploadForm.addEventListener('submit', async (e) => {
+        uploadForm.addEventListener('submit', (e) => {
             e.preventDefault();
-            const formData = new FormData(uploadForm);
+            const file = fileInput.files[0];
             const apiKey = apiKeyInput.value;
+
+            if (!file) {
+                messageDiv.innerHTML = '<p class="text-red-500">Please select a file</p>';
+                return;
+            }
 
             if (!apiKey) {
                 messageDiv.innerHTML = '<p class="text-red-500">API Key is required</p>';
                 return;
             }
 
-            formData.append('apiKey', apiKey);
+            const formData = new FormData();
+            formData.append('file', file);
 
-            try {
-                messageDiv.innerHTML = '<p class="text-blue-500">Uploading...</p>';
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', '/upload', true);
+            xhr.setRequestHeader('X-API-KEY', apiKey);
 
-                const response = await fetch('/upload', {
-                    method: 'POST',
-                    headers: {
-                        'X-API-KEY': apiKey
-                    },
-                    body: formData
-                });
-
-                const data = await response.json();
-
-                if (data.error) {
-                    messageDiv.innerHTML = `<p class="text-red-500">Error: ${data.error}</p>`;
-                } else {
+            xhr.upload.onprogress = (event) => {
+                if (event.lengthComputable) {
+                    const percentComplete = (event.loaded / event.total) * 100;
                     messageDiv.innerHTML = `
-                        <p class="text-green-500">Success: ${data.message}</p>
-                        <p class="mt-2">File URL: <a href="${data.file_url}" class="text-blue-500 hover:underline" target="_blank">${data.file_url}</a></p>
+                        <p class="text-blue-500">Uploading: ${percentComplete.toFixed(2)}%</p>
+                        <div class="w-full bg-gray-200 rounded-full h-2.5 dark:bg-gray-700">
+                            <div class="bg-blue-600 h-2.5 rounded-full" style="width: ${percentComplete}%"></div>
+                        </div>
                     `;
                 }
-            } catch (error) {
-                messageDiv.innerHTML = `<p class="text-red-500">Error: ${error.message}</p>`;
-            }
+            };
+
+            xhr.onload = function() {
+                if (xhr.status === 200) {
+                    const response = JSON.parse(xhr.responseText);
+                    messageDiv.innerHTML = `
+                        <p class="text-green-500">Success: ${response.message}</p>
+                        <p class="mt-2">File URL: <a href="${response.file_url}" class="text-blue-500 hover:underline" target="_blank">${response.file_url}</a></p>
+                    `;
+                } else {
+                    messageDiv.innerHTML = `<p class="text-red-500">Error: ${xhr.statusText}</p>`;
+                }
+            };
+
+            xhr.onerror = function() {
+                messageDiv.innerHTML = `<p class="text-red-500">Error: An error occurred during the upload</p>`;
+            };
+
+            xhr.send(formData);
         });
     </script>
 </body>
+
 </html>
