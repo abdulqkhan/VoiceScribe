@@ -74,6 +74,62 @@ To deploy this application instantly, click the button below:
   </a>
 </p>
 
+
+## Running Locally
+
+To run this application locally for development or testing purposes, follow these steps:
+
+1. **Fork the repository:**
+   Go to https://github.com/thecloudstation/VoiceScribe and click the "Fork" button in the top-right corner of the page.
+
+2. **Clone your forked repository:**
+   ```
+   git clone https://github.com/YOUR_USERNAME/VoiceScribe.git
+   cd VoiceScribe
+   ```
+   Replace `YOUR_USERNAME` with your GitHub username.
+
+3. **Set up a virtual environment:**
+   ```
+   python -m venv venv
+   source venv/bin/activate  # On Windows use `venv\Scripts\activate`
+   ```
+
+4. **Install dependencies:**
+   ```
+   pip install -r requirements.txt
+   ```
+
+5. **Set up environment variables:**
+   Create a `.env` file in the root directory and add the following variables:
+   ```
+   API_KEY=your_chosen_api_key
+   S3_ACCESS_KEY=MINIO_ROOT_USER
+   S3_BUCKET=MINIO_BUCKET
+   S3_ENDPOINT=MINIO_SERVER_URL
+   S3_SECRET_KEY=MINIO_ROOT_PASSWORD
+   WEBHOOK_URL=your_webhook_url
+   MAX_FILE_SIZE=26214400
+   ```
+
+6. **Install FFmpeg:**
+   Ensure FFmpeg is installed on your system. Installation methods vary by operating system:
+   - On Ubuntu/Debian: `sudo apt-get install ffmpeg`
+   - On macOS with Homebrew: `brew install ffmpeg`
+   - On Windows, download from the [official FFmpeg website](https://ffmpeg.org/download.html)
+
+7. **Run the application:**
+   ```
+   python3 run.py
+   ```
+
+   The application will start running, and you'll see output in the console indicating that it's running.
+
+8. **Test the application:**
+   Use tools like cURL or Postman to test the API endpoints as described in the Usage section.
+
+Note: Running locally will use CPU for processing by default. For GPU support, ensure you have the necessary CUDA libraries installed and configured.
+
 ### Deployment Process
 
 This application uses a Dockerfile for automated builds and deployments. When you deploy to CloudStation:
