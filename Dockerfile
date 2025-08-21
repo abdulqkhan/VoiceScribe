@@ -1,5 +1,5 @@
 # Use multi-stage build
-FROM python:3.9-slim-buster AS builder
+FROM python:3.9-slim-bullseye AS builder
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE 1
@@ -19,7 +19,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Final stage
-FROM python:3.9-slim-buster
+FROM python:3.9-slim-bullseye
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE 1
