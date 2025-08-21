@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, jsonify
 import threading
 import uuid
+from urllib.parse import unquote
 
 from app.services import process_audio, process_upload
 from app.utils import configure_logging
@@ -76,6 +77,10 @@ def convert_and_transcribe():
     if not filename:
         logger.error("No filename provided")
         return jsonify({'error': 'No filename provided'}), 400
+    
+    # URL decode the filename to handle special characters from webhooks
+    filename = unquote(filename)
+    logger.info(f"Processing file (after URL decode): {filename}")
 
     if file_source not in ALLOWED_FILE_SOURCES:
         logger.error(f"Invalid file source: {file_source}")
