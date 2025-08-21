@@ -443,6 +443,16 @@ def process_audio(job_id, filename):
         logger.info(f"Uploading analysis report to S3: {report_filename}")
         upload_file(temp_report_file.name, report_filename)
 
+        # Create plain text output (without timestamps)
+        plain_text = result["text"]
+        plain_text_filename = f"{os.path.splitext(filename)[0]}_plain.txt"
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as temp_plain_file:
+            temp_files.append(temp_plain_file.name)
+            temp_plain_file.write(plain_text)
+
+        logger.info(f"Uploading plain text to S3: {plain_text_filename}")
+        upload_file(temp_plain_file.name, plain_text_filename)
+
         jobs[job_id] = {
             'status': 'completed',
             'result': {
@@ -450,7 +460,8 @@ def process_audio(job_id, filename):
                 'original_filename': filename,
                 'transcription_filename': transcription_filename,
                 'srt_filename': srt_filename,
-                'report_filename': report_filename
+                'report_filename': report_filename,
+                'plain_text_filename': plain_text_filename
             }
         }
         logger.info(f"Job {job_id} completed. Sending webhook alert.")
