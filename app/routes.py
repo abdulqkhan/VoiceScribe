@@ -81,8 +81,8 @@ def convert_and_transcribe():
     # URL decode the filename to handle special characters from webhooks
     # unquote_plus handles both %20 and + as spaces
     filename = unquote_plus(filename)
-    # Replace ellipsis character with three dots (common encoding issue)
-    filename = filename.replace('…', '...')
+    # Convert three dots to ellipsis character to match MinIO filename
+    filename = filename.replace('...', '…')
     logger.info(f"Processing file (after URL decode): {filename}")
 
     if file_source not in ALLOWED_FILE_SOURCES:
