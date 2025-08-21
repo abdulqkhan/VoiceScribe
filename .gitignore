@@ -1,3 +1,98 @@
+# Environment variables
 .env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
 venv*
-__pycache__*
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# Virtual environments
+bin/
+include/
+lib/
+lib64/
+share/
+pyvenv.cfg
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing
+.coverage
+.pytest_cache/
+.tox/
+htmlcov/
+.coverage.*
+coverage.xml
+*.cover
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+log/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Uploaded files (in case you test locally)
+uploads/
+temp/
+tmp/
+
+# MinIO data (if running locally)
+minio_data/
+data/
+
+# Model cache
+models/
+.cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Flask
+instance/
+.webassets-cache
+
+# Secrets
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
