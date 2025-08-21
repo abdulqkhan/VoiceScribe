@@ -1,0 +1,6 @@
+# Disable Nixpacks - use Dockerfile instead
+[phases.setup]
+nixpkgs = []
+
+[build]
+skip = true
