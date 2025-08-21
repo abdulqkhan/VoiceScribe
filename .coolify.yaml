@@ -1,0 +1,4 @@
+# Coolify configuration
+# Force single container deployment
+buildPack: dockerfile
+dockerfile: Dockerfile
