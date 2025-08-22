@@ -8,6 +8,7 @@ import subprocess
 import json
 import torch
 import tempfile
+from urllib.parse import quote
 from pydub import AudioSegment
 from difflib import SequenceMatcher
 from pydub.silence import detect_silence
@@ -21,7 +22,9 @@ s3_client = boto3.client('s3',
                          config=Config(signature_version='s3v4'))
 
 def get_public_url(filename):
-    return f"{S3_ENDPOINT}/{S3_BUCKET}/{filename}"
+    # URL encode the filename to handle special characters
+    encoded_filename = quote(filename, safe='')
+    return f"{S3_ENDPOINT}/{S3_BUCKET}/{encoded_filename}"
 
 def get_file_size_from_public_url(url):
     try:
@@ -458,10 +461,15 @@ def process_audio(job_id, filename):
             'result': {
                 'message': 'File processed, transcribed, and analyzed successfully',
                 'original_filename': filename,
+                'original_file_url': get_public_url(filename),
                 'transcription_filename': transcription_filename,
+                'transcription_url': get_public_url(transcription_filename),
                 'srt_filename': srt_filename,
+                'srt_url': get_public_url(srt_filename),
                 'report_filename': report_filename,
-                'plain_text_filename': plain_text_filename
+                'report_url': get_public_url(report_filename),
+                'plain_text_filename': plain_text_filename,
+                'plain_text_url': get_public_url(plain_text_filename)
             }
         }
         logger.info(f"Job {job_id} completed. Sending webhook alert.")
