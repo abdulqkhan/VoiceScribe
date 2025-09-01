@@ -106,28 +106,27 @@ def upload_and_process():
         file_url = process_upload(file, filename)
         logger.info(f"File uploaded successfully: {file_url}")
         
-        # Call existing convert_and_transcribe logic internally
-        with app.test_client() as client:
-            response = client.post('/convert_and_transcribe', 
-                                 json={'filename': filename},
-                                 headers={'X-API-Key': request.headers.get('X-API-Key')})
-            
-            if response.status_code == 202:
-                job_data = response.get_json()
-                job_id = job_data['job_id']
-                
-                # Add email to existing job
-                jobs[job_id]['email'] = email
-                
-                return jsonify({
-                    'message': 'File uploaded and processing started',
-                    'job_id': job_id,
-                    'filename': filename,
-                    'email': email
-                }), 202
-            else:
-                logger.error(f"Convert and transcribe failed: {response.get_json()}")
-                return jsonify({'error': 'Failed to start transcription process'}), 500
+        # Create job directly without using test_client
+        job_id = str(uuid.uuid4())
+        jobs[job_id] = {
+            'status': 'queued',
+            'filename': filename,
+            'is_repurpose': False,
+            'email': email
+        }
+        
+        # Start processing thread directly
+        thread = threading.Thread(target=process_audio, args=(job_id, filename))
+        thread.start()
+        
+        logger.info(f"Job {job_id} created and processing started")
+        
+        return jsonify({
+            'message': 'File uploaded and processing started',
+            'job_id': job_id,
+            'filename': filename,
+            'email': email
+        }), 202
         
     except Exception as e:
         logger.error(f"Error in upload_and_process: {str(e)}")
@@ -176,31 +175,29 @@ def repurpose():
         file_url = process_upload(file, filename)
         logger.info(f"File uploaded successfully: {file_url}")
         
-        # Call existing convert_and_transcribe logic internally
-        with app.test_client() as client:
-            response = client.post('/convert_and_transcribe', 
-                                 json={'filename': filename},
-                                 headers={'X-API-Key': request.headers.get('X-API-Key')})
-            
-            if response.status_code == 202:
-                job_data = response.get_json()
-                job_id = job_data['job_id']
-                
-                # Add repurpose-specific fields to the job
-                jobs[job_id]['email'] = email
-                jobs[job_id]['is_repurpose'] = True
-                jobs[job_id]['repurpose_message'] = repurpose_message
-                
-                return jsonify({
-                    'message': 'File uploaded and repurpose processing started',
-                    'job_id': job_id,
-                    'filename': filename,
-                    'email': email,
-                    'repurpose_message': repurpose_message
-                }), 202
-            else:
-                logger.error(f"Convert and transcribe failed: {response.get_json()}")
-                return jsonify({'error': 'Failed to start transcription process'}), 500
+        # Create job directly without using test_client
+        job_id = str(uuid.uuid4())
+        jobs[job_id] = {
+            'status': 'queued',
+            'filename': filename,
+            'is_repurpose': True,
+            'email': email,
+            'repurpose_message': repurpose_message
+        }
+        
+        # Start processing thread directly
+        thread = threading.Thread(target=process_audio, args=(job_id, filename))
+        thread.start()
+        
+        logger.info(f"Job {job_id} created and repurpose processing started")
+        
+        return jsonify({
+            'message': 'File uploaded and repurpose processing started',
+            'job_id': job_id,
+            'filename': filename,
+            'email': email,
+            'repurpose_message': repurpose_message
+        }), 202
         
     except Exception as e:
         logger.error(f"Error in repurpose: {str(e)}")
