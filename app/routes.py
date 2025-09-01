@@ -66,6 +66,62 @@ def upload():
     logger.error("Unexpected error in file upload")
     return jsonify({'error': 'Unexpected error in file upload'}), 500
 
+@app.route('/upload_and_process', methods=['POST'])
+@authenticate
+def upload_and_process():
+    logger.info("Upload and process endpoint called")
+    
+    # Get email from form data
+    email = request.form.get('email')
+    if not email:
+        logger.error("No email provided")
+        return jsonify({'error': 'Email is required'}), 400
+    
+    # Check if file is present
+    if 'file' not in request.files:
+        logger.error("No file part in the request")
+        return jsonify({'error': 'No file part in the request'}), 400
+    
+    file = request.files['file']
+    if file.filename == '':
+        logger.error("No selected file")
+        return jsonify({'error': 'No selected file'}), 400
+    
+    filename = secure_filename(file.filename)
+    logger.info(f"Received file: {filename} for email: {email}")
+    
+    try:
+        # Upload file first
+        file_url = process_upload(file, filename)
+        logger.info(f"File uploaded successfully: {file_url}")
+        
+        # Call existing convert_and_transcribe logic internally
+        with app.test_client() as client:
+            response = client.post('/convert_and_transcribe', 
+                                 json={'filename': filename},
+                                 headers={'X-API-Key': request.headers.get('X-API-Key')})
+            
+            if response.status_code == 202:
+                job_data = response.get_json()
+                job_id = job_data['job_id']
+                
+                # Add email to existing job
+                jobs[job_id]['email'] = email
+                
+                return jsonify({
+                    'message': 'File uploaded and processing started',
+                    'job_id': job_id,
+                    'filename': filename,
+                    'email': email
+                }), 202
+            else:
+                logger.error(f"Convert and transcribe failed: {response.get_json()}")
+                return jsonify({'error': 'Failed to start transcription process'}), 500
+        
+    except Exception as e:
+        logger.error(f"Error in upload_and_process: {str(e)}")
+        return jsonify({'error': f'Error: {str(e)}'}), 500
+
 @app.route('/convert_and_transcribe', methods=['POST'])
 @authenticate
 def convert_and_transcribe():
@@ -90,7 +146,7 @@ def convert_and_transcribe():
         return jsonify({'error': f'Invalid file source. Allowed sources are: {", ".join(ALLOWED_FILE_SOURCES)}'}), 400
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {'status': 'queued'}
+    jobs[job_id] = {'status': 'queued', 'filename': filename}
     
     thread = threading.Thread(target=process_audio, args=(job_id, filename))
     thread.start()
