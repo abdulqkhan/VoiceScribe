@@ -520,10 +520,20 @@ def send_webhook_alert(job_id, status, result=None):
         logger.warning(f"Webhook URL not set. Skipping webhook alert for job {job_id}.")
         return
 
+    job = jobs.get(job_id, {})
+    
+    # Always include these fields for consistent n8n processing
     payload = {
         'job_id': job_id,
-        'status': status
+        'status': status,
+        'is_repurpose': job.get('is_repurpose', False),
+        'email': job.get('email', None)
     }
+    
+    # Include repurpose_message only if it exists
+    if job.get('repurpose_message'):
+        payload['repurpose_message'] = job.get('repurpose_message')
+    
     if result:
         payload['result'] = result
 
