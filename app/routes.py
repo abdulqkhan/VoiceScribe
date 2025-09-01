@@ -69,9 +69,20 @@ def upload():
 @app.route('/upload_and_process', methods=['POST'])
 @authenticate
 def upload_and_process():
+    """
+    Upload file and start transcription process with email tracking.
+    
+    This endpoint is designed for external systems that need to:
+    1. Upload a file and get an immediate job_id
+    2. Monitor job completion via job_id
+    3. Send email notifications when processing completes
+    
+    The email is stored with the job for external notification services
+    - this app does not send emails directly.
+    """
     logger.info("Upload and process endpoint called")
     
-    # Get email from form data
+    # Get email from form data - required for external notification services
     email = request.form.get('email')
     if not email:
         logger.error("No email provided")
@@ -155,6 +166,23 @@ def convert_and_transcribe():
         'message': 'Task started successfully',
         'job_id': job_id
     }), 202
+
+@app.route('/jobs/active', methods=['GET'])
+def get_active_jobs():
+    active_jobs = []
+    for job_id, job_data in jobs.items():
+        if job_data['status'] in ['queued', 'processing']:
+            active_jobs.append({
+                'job_id': job_id,
+                'status': job_data['status'],
+                'filename': job_data.get('filename'),
+                'email': job_data.get('email')
+            })
+    
+    return jsonify({
+        'active_jobs': active_jobs,
+        'count': len(active_jobs)
+    }), 200
 
 @app.route('/job_status/<job_id>', methods=['GET'])
 def get_job_status(job_id):
