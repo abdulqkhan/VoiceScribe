@@ -365,19 +365,39 @@ def process_audio(job_id, filename):
             temp_files.append(temp_input_file.name)
             temp_input_file.write(file_content)
 
-        # Scale video
-        scaled_video_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
-        temp_files.append(scaled_video_path)
+        # Check if the file has a video stream
+        probe_command = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', temp_input_file.name]
+        probe_output = subprocess.check_output(probe_command, universal_newlines=True)
+        file_info = json.loads(probe_output)
         
-        logger.info(f"Scaling video: {temp_input_file.name} -> {scaled_video_path}")
-        scale_video(temp_input_file.name, scaled_video_path, 25 * 1024 * 1024)  # 25 MiB target size
+        has_video = any(stream['codec_type'] == 'video' for stream in file_info.get('streams', []))
+        has_audio = any(stream['codec_type'] == 'audio' for stream in file_info.get('streams', []))
+        
+        if not has_audio:
+            raise ValueError("No audio stream found in the input file")
+        
+        logger.info(f"File analysis - Has video: {has_video}, Has audio: {has_audio}")
+        
+        # Determine the source file for audio extraction
+        if has_video:
+            # Scale video first
+            scaled_video_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
+            temp_files.append(scaled_video_path)
+            
+            logger.info(f"Video stream detected. Scaling video: {temp_input_file.name} -> {scaled_video_path}")
+            scale_video(temp_input_file.name, scaled_video_path, 25 * 1024 * 1024)  # 25 MiB target size
+            source_file = scaled_video_path
+        else:
+            # Use original file for audio-only files
+            logger.info("Audio-only file detected. Skipping video scaling.")
+            source_file = temp_input_file.name
 
-        # Extract audio from the scaled-down video
+        # Extract/convert audio to WAV format
         audio_path = tempfile.mkstemp(suffix='.wav')[1]
         temp_files.append(audio_path)
         ffmpeg_command = [
             'ffmpeg',
-            '-i', scaled_video_path,
+            '-i', source_file,
             '-acodec', 'pcm_s16le',
             '-ar', '16000',
             '-ac', '1',
@@ -385,7 +405,7 @@ def process_audio(job_id, filename):
             audio_path
         ]
 
-        logger.info(f"Extracting audio: {' '.join(ffmpeg_command)}")
+        logger.info(f"Extracting/converting audio: {' '.join(ffmpeg_command)}")
         subprocess.run(ffmpeg_command, check=True, capture_output=True, text=True)
 
         logger.info("Loading Whisper model...")
