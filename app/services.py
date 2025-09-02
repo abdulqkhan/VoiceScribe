@@ -522,6 +522,9 @@ def send_webhook_alert(job_id, status, result=None):
 
     job = jobs.get(job_id, {})
     
+    # Log the job data for debugging
+    logger.info(f"Job data for {job_id}: {job}")
+    
     # Always include these fields for consistent n8n processing
     payload = {
         'job_id': job_id,
@@ -537,7 +540,10 @@ def send_webhook_alert(job_id, status, result=None):
     if result:
         payload['result'] = result
 
+    # Log the complete payload being sent
+    logger.info(f"Webhook payload for job {job_id}: {json.dumps(payload, indent=2)}")
     logger.info(f"Attempting to send webhook alert for job {job_id} to {WEBHOOK_URL}")
+    
     try:
         response = requests.post(WEBHOOK_URL, json=payload, timeout=10)
         logger.info(f"Webhook response status code: {response.status_code}")

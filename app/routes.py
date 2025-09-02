@@ -108,13 +108,15 @@ def upload_and_process():
         
         # Create job directly without using test_client
         job_id = str(uuid.uuid4())
-        jobs[job_id] = {
+        job_data = {
             'status': 'queued',
             'filename': filename,
             'processing_source': 'manual',
             'is_repurpose': False,
             'email': email
         }
+        jobs[job_id] = job_data
+        logger.info(f"Created job {job_id} with data: {job_data}")
         
         # Start processing thread directly
         thread = threading.Thread(target=process_audio, args=(job_id, filename))
@@ -178,7 +180,7 @@ def repurpose():
         
         # Create job directly without using test_client
         job_id = str(uuid.uuid4())
-        jobs[job_id] = {
+        job_data = {
             'status': 'queued',
             'filename': filename,
             'processing_source': 'manual',
@@ -186,6 +188,8 @@ def repurpose():
             'email': email,
             'repurpose_message': repurpose_message
         }
+        jobs[job_id] = job_data
+        logger.info(f"Created repurpose job {job_id} with data: {job_data}")
         
         # Start processing thread directly
         thread = threading.Thread(target=process_audio, args=(job_id, filename))
