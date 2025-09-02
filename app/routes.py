@@ -148,6 +148,7 @@ def repurpose():
     # Get required fields from form data
     email = request.form.get('email')
     repurpose_message = request.form.get('repurpose_message')
+    video_url = request.form.get('video_url')  # Optional: original video URL
     
     if not email:
         logger.error("No email provided")
@@ -186,6 +187,10 @@ def repurpose():
             'email': email,
             'repurpose_message': repurpose_message
         }
+        
+        # Add video_url if provided
+        if video_url:
+            job_data['video_url'] = video_url
         jobs[job_id] = job_data
         logger.info(f"Created repurpose job {job_id} with data: {job_data}")
         

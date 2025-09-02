@@ -546,6 +546,10 @@ def send_webhook_alert(job_id, status, result=None):
     if job.get('repurpose_message'):
         payload['repurpose_message'] = job.get('repurpose_message')
     
+    # Include video_url only if it exists (original YouTube URL)
+    if job.get('video_url'):
+        payload['video_url'] = job.get('video_url')
+    
     if result:
         payload['result'] = result
 
