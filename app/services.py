@@ -478,6 +478,7 @@ def process_audio(job_id, filename):
 
         # Update job with completion data while preserving original fields
         job_data = jobs[job_id].copy()  # Preserve original job data
+        logger.info(f"Original job data before completion update: {job_data}")
         job_data.update({
             'status': 'completed',
             'result': {
@@ -495,6 +496,7 @@ def process_audio(job_id, filename):
             }
         })
         jobs[job_id] = job_data
+        logger.info(f"Updated job data after completion: {job_data}")
         logger.info(f"Job {job_id} completed. Sending webhook alert.")
         send_webhook_alert(job_id, 'completed', jobs[job_id]['result'])
         logger.info(f"Webhook alert sent for job {job_id}")
