@@ -96,3 +96,6 @@ instance/
 *.crt
 *.p12
 secrets/
+
+# Hosting info with sensitive URLs
+HOSTING_INFO.md
