@@ -476,30 +476,38 @@ def process_audio(job_id, filename):
         logger.info(f"Uploading plain text to S3: {plain_text_filename}")
         upload_file(temp_plain_file.name, plain_text_filename)
 
-        # Update job status while preserving original job data
-        jobs[job_id]['status'] = 'completed'
-        jobs[job_id]['result'] = {
-            'message': 'File processed, transcribed, and analyzed successfully',
-            'original_filename': filename,
-            'original_file_url': get_public_url(filename),
-            'transcription_filename': transcription_filename,
-            'transcription_url': get_public_url(transcription_filename),
-            'srt_filename': srt_filename,
-            'srt_url': get_public_url(srt_filename),
-            'report_filename': report_filename,
-            'report_url': get_public_url(report_filename),
-            'plain_text_filename': plain_text_filename,
-            'plain_text_url': get_public_url(plain_text_filename)
-        }
+        # Update job with completion data while preserving original fields
+        job_data = jobs[job_id].copy()  # Preserve original job data
+        job_data.update({
+            'status': 'completed',
+            'result': {
+                'message': 'File processed, transcribed, and analyzed successfully',
+                'original_filename': filename,
+                'original_file_url': get_public_url(filename),
+                'transcription_filename': transcription_filename,
+                'transcription_url': get_public_url(transcription_filename),
+                'srt_filename': srt_filename,
+                'srt_url': get_public_url(srt_filename),
+                'report_filename': report_filename,
+                'report_url': get_public_url(report_filename),
+                'plain_text_filename': plain_text_filename,
+                'plain_text_url': get_public_url(plain_text_filename)
+            }
+        })
+        jobs[job_id] = job_data
         logger.info(f"Job {job_id} completed. Sending webhook alert.")
         send_webhook_alert(job_id, 'completed', jobs[job_id]['result'])
         logger.info(f"Webhook alert sent for job {job_id}")
 
     except Exception as e:
         logger.error(f"An error occurred in process_audio: {str(e)}")
-        # Update job status while preserving original job data
-        jobs[job_id]['status'] = 'failed'
-        jobs[job_id]['error'] = str(e)
+        # Update job with error while preserving original job data
+        if job_id in jobs:
+            job_data = jobs[job_id].copy()
+            job_data.update({'status': 'failed', 'error': str(e)})
+            jobs[job_id] = job_data
+        else:
+            jobs[job_id] = {'status': 'failed', 'error': str(e)}
         logger.info(f"Job {job_id} failed. Sending webhook alert.")
         send_webhook_alert(job_id, 'failed', {'error': str(e)})
         logger.info(f"Webhook alert sent for failed job {job_id}")

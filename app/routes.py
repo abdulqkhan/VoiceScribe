@@ -4,7 +4,7 @@ import uuid
 from urllib.parse import unquote_plus
 
 from app.services import process_audio, process_upload
-from app.utils import configure_logging
+from app.utils import configure_logging, jobs
 from werkzeug.utils import secure_filename
 from app.utils import authenticate
 from config.settings import ALLOWED_FILE_SOURCES,ALLOWED_EXTENSIONS,API_KEY
@@ -14,8 +14,6 @@ from config.settings import ALLOWED_FILE_SOURCES,ALLOWED_EXTENSIONS,API_KEY
 logger = configure_logging()
 
 app = Flask(__name__)
-
-jobs = {}
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
