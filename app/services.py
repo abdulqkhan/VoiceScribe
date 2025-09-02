@@ -549,6 +549,9 @@ def send_webhook_alert(job_id, status, result=None):
     # Include video_url only if it exists (original YouTube URL)
     if job.get('video_url'):
         payload['video_url'] = job.get('video_url')
+        logger.info(f"Including video_url in webhook payload: {job.get('video_url')}")
+    else:
+        logger.info("No video_url found in job data, not including in webhook payload")
     
     if result:
         payload['result'] = result

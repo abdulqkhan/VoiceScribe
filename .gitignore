@@ -99,3 +99,4 @@ secrets/
 
 # Hosting info with sensitive URLs
 HOSTING_INFO.md
+../HOSTING_INFO.md

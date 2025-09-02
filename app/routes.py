@@ -171,6 +171,7 @@ def repurpose():
     filename = secure_filename(file.filename)
     logger.info(f"Received file: {filename} for repurpose with email: {email}")
     logger.info(f"Repurpose message: {repurpose_message}")
+    logger.info(f"Video URL: {video_url}")
     
     try:
         # Upload file first
@@ -191,6 +192,7 @@ def repurpose():
         # Add video_url if provided
         if video_url:
             job_data['video_url'] = video_url
+            logger.info(f"Added video_url to job data: {video_url}")
         jobs[job_id] = job_data
         logger.info(f"Created repurpose job {job_id} with data: {job_data}")
         
