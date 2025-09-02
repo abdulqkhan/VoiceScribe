@@ -111,6 +111,7 @@ def upload_and_process():
         jobs[job_id] = {
             'status': 'queued',
             'filename': filename,
+            'processing_source': 'manual',
             'is_repurpose': False,
             'email': email
         }
@@ -180,6 +181,7 @@ def repurpose():
         jobs[job_id] = {
             'status': 'queued',
             'filename': filename,
+            'processing_source': 'manual',
             'is_repurpose': True,
             'email': email,
             'repurpose_message': repurpose_message
@@ -271,6 +273,16 @@ def get_job_status(job_id):
         return jsonify({'error': job['error']}), 500
     else:
         return jsonify({'status': 'processing'}), 202
+
+@app.route('/is_processing/<filename>', methods=['GET'])
+def is_processing(filename):
+    """Check if a filename is already being processed by manual upload endpoints"""
+    for job_data in jobs.values():
+        if (job_data.get('filename') == filename and 
+            job_data.get('processing_source') == 'manual' and
+            job_data.get('status') in ['queued', 'processing']):
+            return jsonify({'skip': True}), 200
+    return jsonify({'skip': False}), 200
 
 @app.route('/health', methods=['GET'])
 def health_check():
