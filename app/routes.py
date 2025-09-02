@@ -228,10 +228,19 @@ def convert_and_transcribe():
         logger.error(f"Invalid file source: {file_source}")
         return jsonify({'error': f'Invalid file source. Allowed sources are: {", ".join(ALLOWED_FILE_SOURCES)}'}), 400
 
+    # Check if filename is already being processed by manual upload endpoints
+    for job_data in jobs.values():
+        if (job_data.get('filename') == filename and 
+            job_data.get('processing_source') == 'manual' and
+            job_data.get('status') in ['queued', 'processing']):
+            logger.info(f"Skipping {filename} - already being processed manually")
+            return jsonify({'message': 'File already being processed', 'skipped': True}), 200
+
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         'status': 'queued', 
         'filename': filename,
+        'processing_source': 'auto',  # Flag this as auto-processing
         'is_repurpose': False,  # Default for regular transcription jobs
         'email': None
     }
