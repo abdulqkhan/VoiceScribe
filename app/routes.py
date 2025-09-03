@@ -2,12 +2,13 @@ from flask import Flask, render_template, request, jsonify
 import threading
 import uuid
 from urllib.parse import unquote_plus
+from datetime import timedelta
 
-from app.services import process_audio, process_upload
+from app.services import process_audio, process_upload, s3_client
 from app.utils import configure_logging, jobs
 from werkzeug.utils import secure_filename
 from app.utils import authenticate
-from config.settings import ALLOWED_FILE_SOURCES,ALLOWED_EXTENSIONS,API_KEY
+from config.settings import ALLOWED_FILE_SOURCES,ALLOWED_EXTENSIONS,API_KEY,S3_BUCKET
 
 
 
@@ -306,6 +307,47 @@ def is_processing(filename):
 def health_check():
     logger.info("Health check endpoint called.")
     return jsonify({"status": "healthy"}), 200
+
+@app.route('/api/generate-signed-url', methods=['POST'])
+@authenticate
+def generate_signed_url():
+    try:
+        # Get parameters from request
+        data = request.get_json()
+        filename = data.get('filename')
+        bucket = data.get('bucket', S3_BUCKET)  # Default to S3_BUCKET
+        expires_in = data.get('expires_in', 86400)  # Default to 24 hours (in seconds)
+        
+        if not filename:
+            return jsonify({'error': 'Filename required'}), 400
+        
+        # Validate expires_in (max 7 days for S3 signed URLs)
+        if expires_in > 604800:  # 7 days in seconds
+            expires_in = 604800
+        
+        # Generate presigned URL
+        url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': bucket, 'Key': filename},
+            ExpiresIn=expires_in
+        )
+        
+        # Convert seconds to human readable
+        hours = expires_in / 3600
+        expires_text = f"{hours:.1f} hours" if hours < 48 else f"{hours/24:.1f} days"
+        
+        return jsonify({
+            'success': True,
+            'signed_url': url,
+            'expires_in': expires_text,
+            'expires_in_seconds': expires_in,
+            'filename': filename,
+            'bucket': bucket
+        })
+        
+    except Exception as e:
+        logger.error(f"Error generating signed URL for {bucket}/{filename}: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     logger.info("Starting Flask application...")
